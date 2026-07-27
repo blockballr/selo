@@ -1,0 +1,6 @@
+name = "solana-compressed-accounts"
+version = "0.1.0"
+description = "Read ZK compressed accounts for an owner and verify each merkle proof locally, so balances are cryptographically backed rather than taken on the indexer's word."
+wasm_path = "solana-compressed-accounts.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "config_read"]

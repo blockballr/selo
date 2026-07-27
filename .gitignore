@@ -1,0 +1,29 @@
+/target
+/dist
+Cargo.lock.bak
+
+# The brand system and the working notes stay out of the repository entirely.
+#
+# Neither is part of the thing being shipped. brand/ is identity work: source
+# SVGs, rendered motion, icon sets and concept sheets, several megabytes of it,
+# none of which the crate compiles against. notes/ is thinking: the architecture
+# sketch, the submission plan, draft posts. Both change on a different clock from
+# the code and neither belongs in a reviewer's diff.
+#
+# One consequence to respect rather than work around: the report renderer must
+# not read brand/tokens.css at build or run time. A clone has no brand/, so an
+# include_str! against it would fail to build, and a generated report has to be
+# self-contained anyway because it gets emailed to an accountant. Inline the few
+# token values the report needs as constants in the Rust source.
+brand/
+notes/
+
+# Rendered motion frames are large and reproducible from the script.
+frames_*/
+*.pyc
+__pycache__/
+
+# Local config, never committed. RPC keys and channel credentials live here.
+.env
+*.local.toml
+config.local.*

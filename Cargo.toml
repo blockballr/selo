@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/solana-plugin-core",
+    "crates/solana-compressed-accounts",
+    "crates/daybook-shop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+# Component size is download and load time; ship nothing extra.
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
