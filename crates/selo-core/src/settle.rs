@@ -1,69 +1,8 @@
 //! Settlement: finding payments on chain and matching them to quotes.
 //!
-//! A quote is a promise the shop made. Settlement is the only place that
-//! decides the promise was kept, and the rule it works by is that a sale
-//! is confirmed by the ledger or it is not confirmed at all.
-//!
-//! Why that rule is written down rather than assumed. The agent talks to
-//! customers, and a customer is an untrusted source of text. "I already
-//! paid", "the transfer went through, check again", "my wallet says
-//! confirmed" are all things a real customer says honestly and a thief
-//! says deliberately, and no amount of reading the message distinguishes
-//! them. So nothing in this module accepts a payment claim as an input.
-//! There is no `mark_paid`, no `confirm(signature)` that trusts its
-//! argument, and no function that takes an amount and believes it. The
-//! only way to reach `Settlement::Confirmed` is to hand this module the
-//! raw body of an RPC response and let it do the arithmetic. The model
-//! selects which transaction to look at; the code decides what that
-//! transaction means.
-//!
-//! The same reasoning explains why the merchant address and the mint are
-//! not parameters a caller chooses freely in practice. They come from
-//! `catalog::ShopConfig`, which reads them from operator config, and this
-//! module derives the receiving token account itself with
-//! `pda::associated_token_address` rather than accepting an account to
-//! watch. A caller who could name the account being polled could point
-//! the shop at an address they control. They still could not fake a sale,
-//! because the amount is credited only when chain data shows the merchant
-//! as the owner of the account that gained it, but making the wrong thing
-//! hard to express is cheaper than relying on the last check to catch it.
-//!
-//! How the amount is read is a decision worth stating. The naive route is
-//! to walk the instruction list looking for an SPL transfer, and it is
-//! wrong in both directions: it misses money that arrived through a swap,
-//! a router, or any program that moves tokens by CPI, and it counts money
-//! that an inner instruction later moved back out. Balance deltas do not
-//! have that problem. `meta.preTokenBalances` and `meta.postTokenBalances`
-//! are the ledger's own before and after for every token account the
-//! transaction touched, so the difference across the merchant's accounts
-//! is what the merchant actually ended up with, whatever path it took.
-//!
-//! Everything that is not a clean match becomes an exception rather than
-//! an error or a silent drop. An underpayment is a customer who owes the
-//! difference, an overpayment is a customer owed change, an untagged
-//! transfer is someone sending a round number to the shop address, and a
-//! payment against an expired quote is a real person who paid late. Each
-//! of those needs a human, and each of them carries the signature so the
-//! human can open it in an explorer and see the same facts this module
-//! saw.
-//!
-//! One consequence of tagging is worth stating before it surprises
-//! someone reading an exceptions queue. The tag lives in the digits below
-//! a cent, so a shortfall smaller than a cent does not arrive as a
-//! shortfall at all: it arrives as a different tag. Ten dollars forty
-//! seven, one base unit light, is 10.000346, which reads as order 46 and
-//! not as order 47 underpaid. `Underpaid` and `Overpaid` therefore report
-//! discrepancies that are whole cents, the granularity a customer can
-//! actually get wrong, and anything finer surfaces as `NoMatchingQuote`
-//! or as a mismatch against whichever other order shares those digits.
-//!
-//! That is not a hole, because the property being defended is narrower
-//! and stronger: a quote confirms only when the received amount equals
-//! its `amount_due_base_units` exactly. Every other amount, larger,
-//! smaller, or shifted by a single base unit, produces an exception. So
-//! an attacker who shaves the amount cannot land on a confirmed sale for
-//! less money; the worst they achieve is a queue entry with their
-//! signature on it.
+//! A sale is confirmed by the ledger or not at all. Nothing here accepts a
+//! payment claim as input, and the merchant address and mint come from
+//! operator config rather than from a caller.
 
 use serde_json::{json, Value};
 
@@ -274,11 +213,9 @@ pub fn merchant_token_account_for_program(
 /// Build a `getSignaturesForAddress` request for the merchant's token
 /// account, under the classic SPL Token program.
 ///
-/// `until` is the newest signature already processed. Passing it makes
-/// the poll incremental: the node walks backwards from the tip and stops
-/// there, so a shop that polls every few seconds reads a handful of
-/// entries rather than the whole history. Passing `None` reads the most
-/// recent `limit` entries, which is what a cold start wants.
+/// `until` is the newest signature already processed, which makes the poll
+/// incremental: the node walks back from the tip and stops there. `None`
+/// reads the most recent `limit` entries, which is what a cold start wants.
 pub fn signatures_request(
     merchant: &str,
     mint: &str,
@@ -474,11 +411,9 @@ fn token_deltas(meta: &Value, mint: &str) -> Result<Vec<TokenDelta>, String> {
 
 /// Read a confirmed transaction and report what the merchant received.
 ///
-/// `Ok(None)` covers every "nothing for us here" case: the node does not
-/// have the transaction, the transaction failed, or the merchant's
-/// balance in the settlement mint did not go up. None of those is an
-/// error, and all of them are normal while polling an account that also
-/// sees unrelated traffic.
+/// `Ok(None)` covers every "nothing for us here" case: no such
+/// transaction, a failed one, or no rise in the merchant's balance. All are
+/// normal while polling an account that also sees unrelated traffic.
 ///
 /// The merchant address and the mint come from operator config. They are
 /// the thing being checked against, so a caller who could vary them could
@@ -571,18 +506,13 @@ pub fn parse_settlement_payment(
 
 /// Decide what a received payment means against the open quotes.
 ///
-/// Takes a `ReceivedPayment` that came out of `parse_settlement_payment`
-/// and nothing else. There is deliberately no overload that accepts an
-/// amount, because an amount is exactly what a customer would want to
-/// choose, and a function that accepted one would be a function that can
-/// be talked into confirming a sale nobody paid for.
+/// Takes a `ReceivedPayment` from `parse_settlement_payment` and nothing
+/// else. There is deliberately no overload accepting an amount: that is
+/// exactly what a customer would want to choose.
 ///
-/// The order of the checks matters. Mint first, since a payment in the
-/// wrong token is not a payment at all. Then the tag, then the quote,
-/// then expiry, then the amount. Expiry outranks the amount because a
-/// dead quote cannot be honored however much arrived, and reporting it as
-/// an underpayment would send a human looking for a shortfall that is not
-/// the problem.
+/// Check order matters. Mint first, since a payment in the wrong token is
+/// not a payment. Then tag, quote, expiry, amount. Expiry outranks amount
+/// because a dead quote cannot be honored however much arrived.
 pub fn match_payment(
     payment: &ReceivedPayment,
     open_quotes: &[Quote],

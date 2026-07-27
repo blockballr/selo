@@ -1,10 +1,8 @@
 // Dev helper: emit a base64 SOL transfer with compute budget
 // instructions, for simulating against a real cluster.
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use solana_plugin_core::address::decode_pubkey;
-use solana_plugin_core::transfer::{
-    build_transfer_message_with_priority, shortvec, PriorityFee,
-};
+use selo_core::address::decode_pubkey;
+use selo_core::transfer::{build_transfer_message_with_priority, shortvec, PriorityFee};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();

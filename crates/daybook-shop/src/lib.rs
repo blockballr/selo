@@ -1,35 +1,35 @@
 //! ZeroClaw tool plugin: `daybook_shop`.
 //!
-//! One component holding the whole counter: quote an item, check whether
+//! one component holding the whole counter: quote an item, check whether
 //! it was paid, and close the day.
 //!
-//! Why one component rather than three
+//! why one component rather than three
 //! -----------------------------------
-//! Quoting writes the append-only record of what was sold; settlement
+//! quoting writes the append-only record of what was sold; settlement
 //! reads it to decide what an arriving payment bought. If those lived in
 //! separate components the record would have to travel between them as a
 //! tool argument, which would put it in the model's hands. A manipulated
 //! model could then assert that order 3-47 was for something it was not,
-//! and settlement would have no way to know better. Keeping both in one
+//! and settlement would have no way to know better. keeping both in one
 //! instance means the log is never serialized into a place an injected
-//! instruction can reach.
+//! instruction can reach
 //!
-//! The cost is honest and worth stating: this component holds
+//! worth stating: this component holds
 //! `http_client` because the check action reads the chain, so the quoting
 //! path now runs somewhere network access exists, which is weaker
 //! least-privilege than a quote-only component had. Integrity of the log
 //! is the more important property, since the log is what the day's books
-//! are derived from.
+//! are derived from
 //!
-//! The security model, in one line
+//! the security model
 //! -------------------------------
-//! The model selects, code constructs. The model picks which catalog item
+//! the model selects, code constructs. The model picks which catalog item
 //! a customer seems to want and which order to check on. It cannot name a
 //! price, a discount, a total, a destination address, or declare that a
-//! payment happened. Prices come from operator config. The receiving
+//! payment happened. prices come from operator config. The receiving
 //! address comes from operator config. Confirmation comes from parsed
 //! chain data and nothing else, so a customer insisting they already paid
-//! proves exactly nothing.
+//! proves exactly nothing
 
 #[cfg(target_family = "wasm")]
 mod component {
@@ -45,11 +45,11 @@ mod component {
 
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
-    use solana_plugin_core::catalog::{Catalog, CatalogItem, ShopConfig};
-    use solana_plugin_core::config::RpcConfig;
-    use solana_plugin_core::quote::{issue_quote, Quote};
-    use solana_plugin_core::quotelog::{QuoteEntry, QuoteLog};
-    use solana_plugin_core::settle::{
+    use selo_core::catalog::{Catalog, CatalogItem, ShopConfig};
+    use selo_core::config::RpcConfig;
+    use selo_core::quote::{issue_quote, Quote};
+    use selo_core::quotelog::{QuoteEntry, QuoteLog};
+    use selo_core::settle::{
         candidate_signatures, settle_transaction, ExceptionReason, Settlement,
         DEFAULT_SIGNATURE_LIMIT,
     };
@@ -58,7 +58,7 @@ mod component {
     };
 
     thread_local! {
-        /// Everything this instance has quoted, in issuance order. Owned
+        /// everything this instance has quoted, in issuance order. Owned
         /// here and never handed out, so there is no path by which a tool
         /// argument can rewrite what a past customer was told.
         static QUOTE_LOG: RefCell<QuoteLog> = RefCell::new(QuoteLog::new());
@@ -68,19 +68,20 @@ mod component {
 
     #[derive(serde::Deserialize)]
     struct ExecuteArgs {
-        /// Which operation: `quote`, `check`, or `close`.
+        /// operation: `quote`, `check`, or `close`.
         action: String,
-        /// Catalog sku, for `quote`.
+        /// catalog sku, for `quote`.
         #[serde(default)]
         sku: Option<String>,
-        /// How many units, for `quote`.
+        /// how many units, for `quote`.
         #[serde(default)]
         quantity: Option<u32>,
-        /// Which order to look for, for `check`. Identifies an order this
-        /// instance already issued; it does not describe a payment.
+        /// which order to look for, for `check`
+        /// only identifies an order issued by this instance;
+        /// doesn't describe a payment.
         #[serde(default)]
         order_counter: Option<u8>,
-        /// Seconds since the Unix epoch. Supplied by the caller because a
+        /// seconds since the Unix epoch. Supplied by the caller because a
         /// WASM component has no trustworthy clock, and both quote expiry
         /// and settlement need one.
         now_unix: i64,
@@ -88,7 +89,7 @@ mod component {
         config: HashMap<String, String>,
     }
 
-    /// POST a JSON-RPC body and return the response body as text.
+    /// POST a JSON-RPC body and return the response body as text
     fn rpc_post(cfg: &RpcConfig, body: String) -> Result<String, String> {
         let resp = waki::Client::new()
             .post(&cfg.url)
@@ -112,7 +113,7 @@ mod component {
         Ok(text)
     }
 
-    /// Render base units as a decimal string without floating point.
+    /// render base units as a decimal string without floating point
     fn format_units(base_units: u64, decimals: u8) -> String {
         let scale = 10u64.saturating_pow(decimals as u32);
         format!(
@@ -123,8 +124,12 @@ mod component {
         )
     }
 
-    /// Issue a quote and record it.
-    fn action_quote(args: &ExecuteArgs, shop: &ShopConfig, catalog: &Catalog) -> Result<String, String> {
+    /// issue a quote and record it
+    fn action_quote(
+        args: &ExecuteArgs,
+        shop: &ShopConfig,
+        catalog: &Catalog,
+    ) -> Result<String, String> {
         let sku = args
             .sku
             .as_deref()
@@ -141,9 +146,7 @@ mod component {
                     shop.sales_point
                 ));
             }
-            // The counter comes from the log, never the caller. A chosen
-            // counter could collide with a live order deliberately and
-            // alias a new quote onto an old one's payment.
+            // the counter comes from the log, never the caller
             let counter = log.next_counter(shop.sales_point);
             let quote = issue_quote(
                 shop.sales_point,
@@ -160,13 +163,10 @@ mod component {
         })
     }
 
-    /// The customer-facing payment instruction.
+    /// the customer-facing payment instruction
     ///
-    /// Built from the quote's own fields rather than left to the model to
-    /// summarize. A model-written instruction is an injection surface: it
-    /// could narrate a plausible total while naming a different address.
-    /// The address and amount a customer acts on come from the same code
-    /// that computed them.
+    /// built from the quote's own fields
+    /// summarize. A model-written instruction is an injection surface:
     fn render_quote(quote: &Quote, item: &CatalogItem, shop: &ShopConfig) -> String {
         format!(
             "Order {}-{}: {} x {} ({})\n\
@@ -190,12 +190,11 @@ mod component {
         )
     }
 
-    /// Check the chain for payment of one order.
+    /// check the chain for payment of one order.
     ///
-    /// Note what this function does not accept: an amount, a signature, a
-    /// sender, or any assertion that payment occurred. It is given an
-    /// order number and it goes and looks. A customer saying "I have
-    /// already paid" changes nothing about what it finds.
+    /// does not accept: an amount, a signature, a
+    /// sender, or any assertion. it is given an
+    /// order number and it goes and looks
     fn action_check(args: &ExecuteArgs, shop: &ShopConfig) -> Result<String, String> {
         let counter = args
             .order_counter
@@ -203,13 +202,16 @@ mod component {
 
         let entry: QuoteEntry = QUOTE_LOG.with(|log| {
             let log = log.borrow();
-            let tag = solana_plugin_core::quote::AmountTag::new(shop.sales_point, counter)?;
-            log.find_by_tag(tag)
-                .cloned()
-                .ok_or_else(|| format!("this terminal has no record of order {}-{counter}", shop.sales_point))
+            let tag = selo_core::quote::AmountTag::new(shop.sales_point, counter)?;
+            log.find_by_tag(tag).cloned().ok_or_else(|| {
+                format!(
+                    "this terminal has no record of order {}-{counter}",
+                    shop.sales_point
+                )
+            })
         })?;
 
-        // Reconstruct the quote book this instance is willing to settle
+        // reconstruct the quote book this instance is willing to settle
         // against. Only orders we actually issued are eligible.
         let open: Vec<Quote> = QUOTE_LOG.with(|log| {
             log.borrow()
@@ -233,7 +235,7 @@ mod component {
         let rpc = RpcConfig::from_section(&args.config);
         let sigs_body = rpc_post(
             &rpc,
-            solana_plugin_core::settle::signatures_request(
+            selo_core::settle::signatures_request(
                 &shop.merchant_address,
                 &shop.mint,
                 None,
@@ -245,7 +247,7 @@ mod component {
         for record in &candidates {
             let tx_body = rpc_post(
                 &rpc,
-                solana_plugin_core::settle::settlement_tx_request(&record.signature)?,
+                selo_core::settle::settlement_tx_request(&record.signature)?,
             )?;
             let outcome = settle_transaction(
                 &record.signature,
@@ -258,8 +260,7 @@ mod component {
             let Some(settlement) = outcome else { continue };
             match settlement {
                 Settlement::Confirmed(sale)
-                    if sale.sales_point == shop.sales_point
-                        && sale.order_counter == counter =>
+                    if sale.sales_point == shop.sales_point && sale.order_counter == counter =>
                 {
                     return Ok(format!(
                         "PAID. Order {}-{} for {} x {} settled with {} on chain.\n\
@@ -296,17 +297,21 @@ mod component {
         ))
     }
 
-    /// Turn an exception into something a person can act on, but only for
+    /// turn an exception into something a person can act on, but only for
     /// the order being asked about. Exceptions for other orders belong in
     /// the close, not in this customer's answer.
     fn describe_exception(
-        exception: &solana_plugin_core::settle::SettlementException,
+        exception: &selo_core::settle::SettlementException,
         shop: &ShopConfig,
         counter: u8,
     ) -> Option<String> {
         let d = shop.decimals;
         match &exception.reason {
-            ExceptionReason::Underpaid { expected, received, shortfall } => Some(format!(
+            ExceptionReason::Underpaid {
+                expected,
+                received,
+                shortfall,
+            } => Some(format!(
                 "UNDERPAID. Order {}-{} expected {} but {} arrived, short by {}.\n\
                  Signature: {}\n\
                  Not confirmed. The shop owner decides whether to accept it.",
@@ -317,7 +322,11 @@ mod component {
                 format_units(*shortfall, d),
                 exception.signature,
             )),
-            ExceptionReason::Overpaid { expected, received, excess } => Some(format!(
+            ExceptionReason::Overpaid {
+                expected,
+                received,
+                excess,
+            } => Some(format!(
                 "OVERPAID. Order {}-{} expected {} but {} arrived, {} too much.\n\
                  Signature: {}\n\
                  Not confirmed. The customer is owed change and a human must handle it.",
@@ -328,27 +337,27 @@ mod component {
                 format_units(*excess, d),
                 exception.signature,
             )),
-            ExceptionReason::QuoteExpired { sales_point, order_counter, expires_at_unix }
-                if *sales_point == shop.sales_point && *order_counter == counter =>
-            {
-                Some(format!(
-                    "PAID LATE. Order {}-{} was paid with {} but the quote had expired at unix {}.\n\
+            ExceptionReason::QuoteExpired {
+                sales_point,
+                order_counter,
+                expires_at_unix,
+            } if *sales_point == shop.sales_point && *order_counter == counter => Some(format!(
+                "PAID LATE. Order {}-{} was paid with {} but the quote had expired at unix {}.\n\
                      Signature: {}\n\
                      Not confirmed automatically. The shop owner decides whether to honor it.",
-                    sales_point,
-                    order_counter,
-                    format_units(exception.amount_base_units, d),
-                    expires_at_unix,
-                    exception.signature,
-                ))
-            }
+                sales_point,
+                order_counter,
+                format_units(exception.amount_base_units, d),
+                expires_at_unix,
+                exception.signature,
+            )),
             _ => None,
         }
     }
 
-    /// Report the day as this terminal saw it.
+    /// report the day as this terminal saw it.
     ///
-    /// Reads only the append-only log, so it cannot be talked into
+    /// reads only the append-only log, so it cannot be talked into
     /// omitting a sale or inventing one.
     fn action_close(args: &ExecuteArgs, shop: &ShopConfig) -> Result<String, String> {
         QUOTE_LOG.with(|log| {
@@ -362,7 +371,7 @@ mod component {
             }
             let mut lines = Vec::with_capacity(entries.len() + 2);
             lines.push(format!(
-                "Sales point {}: {} quotes issued.",
+                "sales point {}: {} quotes issued.",
                 shop.sales_point,
                 entries.len()
             ));
@@ -376,7 +385,11 @@ mod component {
                     e.quantity,
                     e.sku,
                     format_units(e.amount_due_base_units, shop.decimals),
-                    if e.is_expired(args.now_unix) { "expired" } else { "open" },
+                    if e.is_expired(args.now_unix) {
+                        "expired"
+                    } else {
+                        "open"
+                    },
                 ));
             }
             lines.push(format!(
@@ -384,7 +397,7 @@ mod component {
                 format_units(total.min(u64::MAX as u128) as u64, shop.decimals)
             ));
             lines.push(
-                "This is what was quoted. Which of these were paid is settled against the \
+                "this is what was quoted. Which of these were paid is settled against the \
                  chain, not asserted here."
                     .to_string(),
             );
@@ -439,7 +452,7 @@ mod component {
         }
 
         fn description() -> String {
-            "Run the shop counter. Use action=quote with a catalog sku to give a customer a \
+            "run the shop counter. Use action=quote with a catalog sku to give a customer a \
              price and an exact payment amount; action=check with an order_counter to see \
              whether that order was actually paid on chain; action=close to list what this \
              terminal quoted. Prices come from the shop's configured catalog and payment \
@@ -451,9 +464,9 @@ mod component {
         }
 
         fn parameters_schema() -> String {
-            // Deliberately minimal. There is no price, total, discount,
-            // amount, mint, address or signature parameter, because each
-            // would be a lever a manipulated model could pull.
+            // deliberately minimal. no price, total, discount,
+            // amount, mint, address or signature parameter.
+            // no level for a manipulated model to pull
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -502,7 +515,11 @@ mod component {
             match run(&parsed) {
                 Ok(output) => {
                     log_outcome(PluginOutcome::Success, "shop action complete");
-                    Ok(ToolResult { success: true, output, error: None })
+                    Ok(ToolResult {
+                        success: true,
+                        output,
+                        error: None,
+                    })
                 }
                 Err(message) => {
                     log_outcome(PluginOutcome::Failure, "shop action refused");

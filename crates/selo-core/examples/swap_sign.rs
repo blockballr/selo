@@ -8,9 +8,9 @@
 // sigVerify enabled: a bad signature fails verification, while a
 // correct signature on an unfunded wallet fails on funds instead.
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use solana_plugin_core::address::encode_pubkey;
-use solana_plugin_core::transfer::Keypair;
-use solana_plugin_core::vtx;
+use selo_core::address::encode_pubkey;
+use selo_core::transfer::Keypair;
+use selo_core::vtx;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

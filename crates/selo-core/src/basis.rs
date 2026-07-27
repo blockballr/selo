@@ -1,58 +1,16 @@
 //! Cost basis: acquisitions opened as lots, disposals closed against them.
 //!
-//! The daily ledger says what moved. It does not say what it cost, and
-//! that is the difference between a record of the year and a tax return.
-//! A disposal is only reportable once it names the lot it consumed: the
-//! date that lot was acquired, what was paid for it, what the disposal
-//! brought in, and the difference between the two. That is one line of a
-//! Form 8949. The point of tracking it daily is that filing becomes a
-//! lookup instead of a reconstruction from a year of transaction hashes
-//! done in April by someone who no longer remembers the trades.
+//! `LotBook` takes its lot method at construction and there is no setter.
+//! A caller choosing FIFO for one sale and HIFO for the next is shopping
+//! for a number, so the type makes it unrepresentable.
 //!
-//! Three properties are enforced here, and each one exists because the
-//! obvious shortcut is the thing that makes a book indefensible.
+//! Every lot carries a `BasisEvidence` class with no default, so an
+//! oracle-derived cost cannot be spelled without naming its source and
+//! timestamp. The class travels onto every disposal derived from it.
 //!
-//! The lot method is declared once and applied to everything. `LotBook`
-//! takes its method at construction and there is no way to pass one to
-//! `dispose`, and no setter to change it afterwards. This is deliberate
-//! and it is the most important design decision in the module. A caller
-//! that could choose FIFO for one sale and HIFO for the next would not
-//! be doing accounting, it would be shopping for a number, and an
-//! examiner who spots that pattern has grounds to throw out the whole
-//! book rather than just the flattering lines. Making consistency a
-//! convention that a careful caller follows is not enough, because the
-//! failure is silent and the incentive to fail runs one way. So the
-//! type makes the wrong thing unrepresentable.
-//!
-//! Every lot carries an evidence class and it is not optional. Proceeds
-//! from a swap are exact and self evidencing: the executed rate is in
-//! the transaction as balance deltas, and anyone can re-derive it from
-//! the chain. The cost of an income event is not. A staking reward or an
-//! airdrop arrives with a quantity and no price, and the basis has to
-//! come from an external source at the acquisition time. That number is
-//! the weak link in every tool of this kind, and most of them hide it by
-//! writing it into the same field as an exact one. Here the two cannot
-//! be confused, because `BasisEvidence` has no default and no way to
-//! spell "oracle derived" without naming the source and the timestamp it
-//! was read at. The class travels from the lot onto every disposal
-//! record derived from it and onto the canonical line, so a reviewer can
-//! sort the year's disposals by how much they should be trusted.
-//!
-//! Determinism is a hard requirement for the same reason it is in
-//! `ledger`: this output gets hashed and anchored, and an auditor
-//! re-derives it to check the anchor. So there is no `HashMap` whose
-//! iteration order could reach the output, no clock read anywhere, no
-//! floating point, and lot selection uses a total order in which every
-//! tie is broken by data rather than by luck. Two runs over the same
-//! events produce the same bytes.
-//!
-//! Money is integers throughout. Quantities and costs are unsigned,
-//! because a negative quantity held is not a thing that happens and a
-//! negative cost is a bug wearing a number. Gains are `i128`, because a
-//! loss is the entire reason anyone tracks basis in a bad year. Every
-//! multiplication is checked: quantity times price is exactly where a
-//! nine decimal mint meets a large balance, and a wrapped product in a
-//! tax figure is worse than a refusal, because the refusal gets fixed.
+//! Deterministic like `ledger`, since this gets hashed and anchored: no
+//! map iteration order, no clock, no floating point, ties broken by data.
+//! Money is integers, gains are `i128`, every multiplication checked.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -103,12 +61,10 @@ impl LotMethod {
 
     /// Read the method from the jailed config section, key `lot_method`.
     ///
-    /// This fails closed, like the catalog and unlike the RPC settings.
-    /// An absent endpoint can fall back to a public node and the worst
-    /// case is a slow call; an absent lot method has no safe default,
-    /// because picking one silently would decide the operator's tax
-    /// figure for them and the resulting book would claim an election
-    /// that was never made.
+    /// Fails closed, like the catalog. An absent endpoint can fall back to a
+    /// public node; an absent lot method cannot, because picking one silently
+    /// would decide the operator's tax figure and claim an election never
+    /// made.
     pub fn from_section(section: &HashMap<String, String>) -> Result<Self, String> {
         let raw = section
             .get("lot_method")
@@ -126,14 +82,10 @@ impl LotMethod {
 
 /// Where a lot's cost figure came from.
 ///
-/// There is deliberately no `Default` and no plain "unknown" variant.
-/// A basis with no stated provenance is the thing this type exists to
-/// make impossible: it would be a number in a tax return that nobody,
-/// including the person who filed it, could say the origin of. The two
-/// variants are the only two honest answers, and the oracle one cannot
-/// be constructed without saying which source and at what time, because
-/// a price with no source is a guess and a price with no timestamp
-/// cannot be checked against the market that day.
+/// No `Default` and no "unknown" variant. A basis with no provenance is
+/// exactly what this type exists to make impossible. The oracle variant
+/// cannot be built without naming its source and timestamp: a price with
+/// no source is a guess, and one with no timestamp cannot be checked.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BasisEvidence {
     /// The cost is a difference between two integers the chain reported.
@@ -298,12 +250,10 @@ impl Disposal {
 
     /// The record as one canonical line of text.
     ///
-    /// Fixed shape, for the same reason `LedgerEvent::canonical_line` is
-    /// fixed: it is what gets hashed. Tab separated, fields in this
-    /// order, absent values written as a single hyphen, integers in base
-    /// ten with no separators. The evidence occupies three columns
-    /// rather than one packed string so that a source containing a
-    /// separator cannot shift the meaning of the fields after it.
+    /// Fixed shape, because it is what gets hashed. Tab separated, this field
+    /// order, absent values a single hyphen, integers base ten. Evidence takes
+    /// three columns rather than one packed string, so a source containing a
+    /// separator cannot shift the fields after it.
     pub fn canonical_line(&self) -> String {
         let (source, priced_at) = match &self.basis_evidence {
             BasisEvidence::ExactFromChain => ("-".to_string(), "-".to_string()),
@@ -361,12 +311,10 @@ pub fn total_gain(records: &[Disposal]) -> Result<i128, String> {
 /// one whole token in the reporting currency's smallest unit, and
 /// `asset_decimals` is what converts between them.
 ///
-/// The multiplication is checked because this is precisely where a nine
-/// decimal mint meets a real balance and a wrapped product would become
-/// a plausible looking basis. Division truncates, and it is left
-/// truncating on purpose: the result is reproducible by anyone with the
-/// same three integers, and understating a basis never understates the
-/// gain, so a rounding artifact can never land in the filer's favour.
+/// Checked multiplication: this is where a nine decimal mint meets a real
+/// balance and a wrapped product becomes a plausible basis. Division
+/// truncates on purpose, so the result is reproducible and a rounding
+/// artifact never lands in the filer's favour.
 pub fn oracle_cost(
     quantity_base_units: u128,
     unit_price_base_units: u128,
@@ -427,12 +375,10 @@ impl LotBook {
 
     /// Record an acquisition.
     ///
-    /// A zero quantity acquisition is refused rather than stored. It
-    /// would be a lot nothing can ever consume, and if it carried a cost
-    /// that cost would sit in the book forever without ever reaching a
-    /// disposal record, which is basis quietly disappearing. Whatever
-    /// produced it is wrong, and saying so at the point it happened is
-    /// cheaper than finding a hole in the totals next April.
+    /// A zero quantity acquisition is refused, not stored. It would be a lot
+    /// nothing can consume, and any cost on it would sit in the book without
+    /// ever reaching a disposal record. Saying so now is cheaper than finding
+    /// a hole in April.
     pub fn acquire(&mut self, lot: Lot) -> Result<(), String> {
         let mint = clean_field(&lot.mint, "mint")?;
         let acquisition_ref = clean_field(&lot.acquisition_ref, "acquisition_ref")?;
@@ -473,30 +419,16 @@ impl LotBook {
 
     /// Close a disposal against the open lots and produce its records.
     ///
-    /// One record per lot consumed, not one aggregated record per
-    /// disposal. A sale that eats three lots returns three records. That
-    /// choice costs a little verbosity and buys two things a single row
-    /// cannot have. First, each row has one acquisition date, so the
-    /// holding period is a fact on the line rather than the word
-    /// "various" standing in for a computation the reader cannot check.
-    /// Second, each row has one evidence class, so an exact basis and an
-    /// oracle derived one are never averaged into a single number whose
-    /// provenance is then unstateable. Callers that want a summary row
-    /// can sum these; callers given a summary row can never get these
-    /// back.
+    /// One record per lot consumed, not one aggregated row, so each row has a
+    /// single acquisition date and a single evidence class. Callers can sum
+    /// these; they cannot recover them from a summary.
     ///
-    /// Disposing more than the book holds is an error and the book is
-    /// left exactly as it was. It is not clamped to what is on hand and
-    /// it does not open a negative position, because either of those
-    /// would paper over the real defect, which is an acquisition that
-    /// never made it into the book. A short position that nobody took is
-    /// a missing input wearing a plausible number.
+    /// Disposing more than the book holds is an error and leaves the book
+    /// untouched. Clamping or opening a negative position would paper over the
+    /// real defect, an acquisition that never got recorded.
     ///
-    /// A zero quantity disposal produces no records at all, the same way
-    /// a zero balance delta produces no ledger event: an 8949 line
-    /// saying nothing was sold for nothing is noise in a document that
-    /// gets read by hand. It is only accepted when the proceeds are also
-    /// zero, since money arriving for nothing is a defect, not a sale.
+    /// A zero quantity produces no records, and is only accepted when the
+    /// proceeds are also zero.
     pub fn dispose(&mut self, event: DisposalEvent) -> Result<Vec<Disposal>, String> {
         let mint = clean_field(&event.mint, "mint")?;
         let disposal_ref = clean_field(&event.disposal_ref, "disposal_ref")?;
@@ -671,12 +603,10 @@ impl LotBook {
 
     /// Refuse an event that predates the last one accepted.
     ///
-    /// Lot selection depends on what was open at the moment of the
-    /// disposal, so an acquisition slipped in behind a disposal that has
-    /// already been reported would change a record this book has already
-    /// handed out and hashed. Rather than silently produce a book that
-    /// disagrees with its own history, the out of order event is
-    /// refused and the caller has to replay from the start.
+    /// Lot selection depends on what was open at the disposal, so an
+    /// acquisition slipped in behind an already-reported disposal would change
+    /// a record this book has handed out and hashed. Out of order events are
+    /// refused; the caller replays from the start.
     fn check_time_order(&self, at: i64, what: &str, reference: &str) -> Result<(), String> {
         if let Some(last) = self.last_event_unix {
             if at < last {
@@ -694,12 +624,10 @@ impl LotBook {
 /// The indices of the open lots of one mint, in the order the method
 /// consumes them.
 ///
-/// Both orders are total. FIFO breaks a tie on acquisition time with the
-/// acquisition reference and then the acceptance sequence, and HIFO
-/// falls back to the whole FIFO key once unit costs tie, so equal cost
-/// lots still leave oldest first. Nothing here depends on the order the
-/// lots happen to sit in the vector beyond that last resort sequence,
-/// which is itself part of the input.
+/// Both orders are total. FIFO breaks ties on acquisition reference then
+/// acceptance sequence; HIFO falls back to the whole FIFO key, so equal
+/// cost lots still leave oldest first. Nothing depends on vector order
+/// beyond that last resort.
 fn selection_order(method: LotMethod, mint: &str, lots: &[OpenLot]) -> Vec<usize> {
     let mut indices: Vec<usize> = lots
         .iter()
@@ -742,14 +670,10 @@ fn cmp_unit_cost(a: &OpenLot, b: &OpenLot) -> Ordering {
 
 /// Compare `a/b` with `c/d` exactly, for positive denominators.
 ///
-/// The obvious implementation is to cross multiply, and it is wrong
-/// here: `a * d` on two large `u128` values overflows, and an overflow
-/// inside a comparator is not a wrong answer once, it is a sort order
-/// that is not an order at all, which would make lot selection depend on
-/// the sort implementation. This compares the integer parts and then
-/// recurses on the inverted remainders instead, so it never multiplies
-/// anything. It terminates for the same reason Euclid's algorithm does:
-/// the remainders strictly decrease.
+/// Cross multiplying overflows on large `u128` values, and an overflow
+/// inside a comparator is not a wrong answer once, it is a sort order that
+/// is not an order. This compares integer parts and recurses on inverted
+/// remainders, which terminates for Euclid's reason.
 fn cmp_ratio(mut a: u128, mut b: u128, mut c: u128, mut d: u128) -> Ordering {
     // A lot with no quantity left is never offered to this comparator,
     // but defining the degenerate case keeps the function total.
@@ -842,12 +766,10 @@ pub fn lot_from_event(
 
 /// Turn a ledger payout event into a disposal, given its proceeds.
 ///
-/// A `FeePaid` event is refused even though a network fee is, strictly
-/// read, a disposal of SOL. Whether a fee is a capital disposal or a
-/// deductible business expense is a policy question with two defensible
-/// answers, and this module will not pick one on the operator's behalf
-/// and bury the choice in a conversion helper. A caller that has decided
-/// can build the `DisposalEvent` directly.
+/// `FeePaid` is refused even though a fee is strictly a disposal of SOL.
+/// Whether it is a capital disposal or a deductible expense is a policy
+/// question with two defensible answers, and this will not pick one and
+/// bury it in a helper. Build the `DisposalEvent` directly.
 pub fn disposal_from_event(
     event: &LedgerEvent,
     proceeds_base_units: u128,

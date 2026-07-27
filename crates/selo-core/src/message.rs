@@ -1,29 +1,12 @@
 //! Generic legacy message compilation.
 //!
-//! The earlier builders in `transfer` and `token` hand-index their
-//! accounts: they lay out the key vector by hand and write literal
-//! indices into each instruction. That is readable at four or five
-//! accounts and it is verified against mainnet, so it stays as it is.
+//! `transfer` and `token` hand-index their accounts, which is fine at five
+//! and a bug waiting to happen at ten. Callers here describe accounts by
+//! meaning and this module derives the canonical ordering, merging
+//! duplicates by the union of their flags.
 //!
-//! It does not survive contact with the delegation instructions. Those
-//! take nine and ten accounts in a fixed order, mixing signers and
-//! writables, and one transposed index produces a transaction that
-//! still serializes, still signs, and then either fails on chain or
-//! moves tokens using the wrong account. Hand-indexing that is a bug
-//! waiting to happen, so this module does the bookkeeping once.
-//!
-//! Callers describe accounts by meaning, as `AccountMeta` values with
-//! signer and writable flags, and this module derives the canonical
-//! ordering the runtime requires: writable signers, readonly signers,
-//! writable non-signers, readonly non-signers, with the fee payer first.
-//! Duplicate references to one account are merged, taking the union of
-//! the flags, because an account that is writable in any instruction is
-//! writable in the message.
-//!
-//! The regression test at the foot of this file compiles the same
-//! transfer the hand-built `token` path produces and asserts the bytes
-//! are identical, which pins this implementation to a layout already
-//! confirmed against mainnet.
+//! The regression test pins the output to the hand-built `token` layout,
+//! which is itself confirmed against mainnet.
 
 use crate::transfer::shortvec;
 
@@ -68,11 +51,9 @@ pub struct Instruction {
 
 /// Compile instructions into a serialized legacy message.
 ///
-/// `fee_payer` is forced into index 0 as a writable signer, which the
-/// runtime requires: it is the account debited for the fee. Program ids
-/// are appended as readonly non-signers if they are not already
-/// referenced, since a program must appear in the account table to be
-/// callable.
+/// `fee_payer` is forced to index 0 as a writable signer, which the runtime
+/// requires since it is debited for the fee. Program ids are appended as
+/// readonly non-signers if not already referenced.
 ///
 /// Returns the message bytes, which are exactly what gets signed.
 pub fn compile_message(

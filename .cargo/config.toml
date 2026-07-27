@@ -1,6 +1,4 @@
-# Poseidon over BN254 uses large stack frames for field arithmetic, and a
-# 32 level merkle proof folds 32 of them. wasm-ld defaults the component
-# stack to 1 MiB, which an unoptimised build of that path can exhaust, so
-# give it real headroom rather than relying on the optimiser to save it.
+# No shipped component folds Poseidon today. Kept for when the close path
+# is wired into one; wasm-ld's 1 MiB default is not enough for it.
 [target.wasm32-wasip2]
 rustflags = ["-C", "link-arg=-zstack-size=8388608"]

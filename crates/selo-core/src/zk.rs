@@ -1,29 +1,12 @@
 //! ZK compression: compressed account proofs and their verification.
 //!
-//! ZK compression keeps account data off chain in a merkle tree and
-//! stores only a small commitment on chain, which is how large airdrops
-//! are distributed cheaply. Reading it requires a Photon indexer rather
-//! than an ordinary RPC node.
+//! Reading compressed state means asking a Photon indexer, so the proof is
+//! fetched alongside the balance and the root recomputed here rather than
+//! taking the indexer's word.
 //!
-//! That indexer is the reason this module exists in the form it does.
-//! Asking an indexer for a balance and printing the answer means
-//! trusting a third party's claim about chain state. Instead the plugin
-//! asks for the merkle proof alongside the balance and recomputes the
-//! root itself, so a wrong or malicious answer is caught rather than
-//! reported as fact. This is the same stance the swap plugin takes when
-//! it refuses to sign a transaction it has not parsed.
-//!
-//! Two details had to match Light Protocol exactly, and both were read
-//! from its source rather than guessed. The hasher is Poseidon over
-//! BN254 with circom parameters (`program-libs/hasher/src/poseidon.rs`
-//! uses `Poseidon::<Fr>::new_circom` with `hash_bytes_be`). The sibling
-//! ordering is taken from `compute_parent_node` in
-//! `program-libs/concurrent-merkle-tree/src/hash.rs`:
-//!
-//! ```text
-//! let is_left = (node_index >> level) & 1 == 0;
-//! if is_left { H(node, sibling) } else { H(sibling, node) }
-//! ```
+//! Two details match Light Protocol exactly and were read from its source:
+//! Poseidon over BN254 with circom parameters, and sibling ordering by
+//! `(node_index >> level) & 1`.
 
 use ark_bn254::Fr;
 use light_poseidon::{Poseidon, PoseidonBytesHasher};
@@ -38,12 +21,9 @@ const MAX_PROOF_DEPTH: usize = 40;
 
 /// Build the Poseidon hasher once.
 ///
-/// Constructing it is not cheap: it materialises the full circom round
-/// constant and MDS matrix set. Doing that per hash meant building it
-/// once per tree level, which overflowed the stack on a 32 level proof
-/// in an unoptimised build and would be far worse inside a component,
-/// where the stack is smaller than a native thread's. It is boxed so
-/// those parameters live on the heap rather than in a stack frame.
+/// Constructing it materialises the full circom round constant and MDS
+/// set. Doing that per tree level overflowed the stack on a 32 level proof
+/// in an unoptimised build. Boxed so those live on the heap.
 fn hasher() -> Result<Box<Poseidon<Fr>>, String> {
     Poseidon::<Fr>::new_circom(2)
         .map(Box::new)
@@ -318,11 +298,9 @@ pub fn parse_account_proof(body: &str) -> Result<AccountProof, String> {
 mod tests {
     use super::*;
 
-    /// Build a full binary tree of the given depth over `leaves`, then
-    /// return its root plus the proof for `index`. This is an
-    /// independent construction: the test builds the tree bottom up
-    /// while `compute_root` folds a single path, so agreement between
-    /// them is a real check rather than a restatement.
+    /// Build a full binary tree over `leaves`, then return its root and the
+    /// proof for `index`. Independent construction: this builds bottom up while
+    /// `compute_root` folds one path, so agreement is a real check.
     fn tree_root_and_proof(
         leaves: &[[u8; 32]],
         index: usize,

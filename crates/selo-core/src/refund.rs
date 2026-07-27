@@ -1,66 +1,16 @@
 //! Refunds: the one place the shop sends money out.
 //!
-//! Everything else in this crate reads. This module writes, so it is the
-//! module an attacker wants. The design rule it enforces is the same one
-//! `catalog` and `settle` follow, stated here in its strongest form:
+//! No function here takes a refund amount, a destination or a mint. All
+//! three come from what the ledger says arrived, so an injected model has
+//! no parameter to set.
 //!
-//!   the model selects, code constructs.
+//! `render_approval` parses the signable bytes back and refuses if any
+//! field disagrees, so the human reads a rendering of what they sign.
 //!
-//! Concretely, a caller names an order and nothing else that touches
-//! money. There is no function in this file that accepts a refund
-//! amount, a destination address, or a mint as an argument. The amount is
-//! the amount the ledger says arrived, the destination is the token
-//! account owner the ledger says it left, and the mint is the mint the
-//! ledger says moved. That is not a preference about how to call the API,
-//! it is the API: a prompt-injected model cannot inflate a refund or
-//! redirect it, because there is no parameter to set. A check can be
-//! argued past by a sufficiently persuasive story; a parameter that does
-//! not exist cannot.
-//!
-//! The obvious alternative, "the agent prepares and a human signs", is
-//! not a safety property on its own. It is blind signing with extra
-//! steps. A human approving a transaction they cannot read is approving
-//! whatever the agent put in front of them, and the failure looks exactly
-//! like ordinary work: a plausible sentence, a tap, money gone. Human
-//! approval becomes a control only when the thing the human reads is
-//! derived from the thing they sign, which is what `render_approval`
-//! exists to guarantee.
-//!
-//! That is worth spelling out because it is the subtle part. A summary
-//! written by a model can describe a perfectly reasonable refund while
-//! the bytes underneath say something else entirely, and the human
-//! approves a lie in good faith. So `render_approval` takes no strings
-//! from anyone. It parses the compiled message back out of the bytes with
-//! `parse_refund_message`, cross-checks every parsed field against the
-//! facts this module derived, re-derives the destination token account
-//! from the payer address it is about to name so the text cannot claim
-//! one wallet while the bytes pay another, and refuses to render at all
-//! if any of that disagrees. What the human reads is therefore a
-//! rendering of the signable bytes, not a description of them. The two
-//! facts that genuinely are not in the bytes, the signature of the
-//! payment being refunded and the order it belongs to, are printed under
-//! a heading that says so, because a human who cannot tell which claims
-//! were verified cannot weigh them.
-//!
-//! Two further decisions are stated here because they look like
-//! omissions otherwise.
-//!
-//! The destination is `ReceivedPayment::source_owner`, the owner of the
-//! token account the money actually left, and not the fee payer. A
-//! transaction's fee payer can be a relayer who never held the funds, and
-//! refunding them would hand the money to the wrong person while looking
-//! correct. When the money came through a swap or a router there is no
-//! single source account, `source_owner` is `None`, and this module
-//! refuses rather than guessing. A refund nobody can address is a human's
-//! problem, not a coin flip.
-//!
-//! The idempotency record is written when the refund is prepared, not
-//! when it confirms on chain. Recording at confirmation leaves a window
-//! in which two refunds for one order can both be prepared and both be
-//! signed, and that window is a drain. Recording at preparation means a
-//! prepared refund that is never signed blocks a retry until a human
-//! clears it, which is an annoyance. An annoyance is the correct thing to
-//! trade a drain for.
+//! Destination is the owner of the account the money left, not the fee
+//! payer, and refuses when there is no single source. Idempotency is
+//! recorded at preparation, trading a stuck retry for a double-spend
+//! window.
 
 use std::collections::HashMap;
 
@@ -90,31 +40,25 @@ const IX_CREATE_IDEMPOTENT: u8 = 1;
 /// How long after a payment a refund may still be prepared, by default:
 /// twenty four hours.
 ///
-/// Short on purpose. The window is a bound on how long a stolen or
-/// injected instruction remains useful against a day's takings, so the
-/// default is the shortest span that still covers a customer who comes
-/// back the next morning. Operators who sell things people return later
-/// raise it deliberately.
+/// Short on purpose: the window bounds how long an injected instruction
+/// stays useful against a day's takings. The default is the shortest span
+/// still covering a customer who returns next morning.
 pub const DEFAULT_REFUND_WINDOW_SECS: u32 = 86_400;
 
 /// Default ceiling on refunds in any rolling day, in the settlement
 /// mint's base units: a hundred whole units on a six decimal mint.
 ///
-/// Base units rather than whole tokens because that is what every other
-/// amount in this crate is, and mixing the two near money is how a
-/// thousand-fold error happens. The consequence is that this default is
-/// only meaningful for a six decimal mint, so an operator on any other
-/// mint must set the key. That is the safe direction: on a mint with more
-/// decimals the default is a smaller real ceiling, never a larger one.
+/// Base units, like every other amount here; mixing the two near money is
+/// how a thousand-fold error happens. The default is therefore only
+/// meaningful on a six decimal mint. That is the safe direction: more
+/// decimals makes it a smaller real ceiling, never larger.
 pub const DEFAULT_MAX_REFUND_PER_DAY_BASE_UNITS: u64 = 100_000_000;
 
 /// The span the daily ceiling is measured over.
 ///
-/// A rolling twenty four hours rather than a calendar day, for two
-/// reasons. A calendar day needs a timezone this plugin does not have,
-/// and a calendar boundary is a hole: refund the ceiling at 23:59 and the
-/// ceiling again at 00:01 and the day's limit has been doubled by a
-/// clock. A rolling window has no such seam.
+/// Rolling twenty four hours, not a calendar day. A calendar day needs a
+/// timezone this does not have, and its boundary is a hole: refund the
+/// ceiling at 23:59 and again at 00:01 and the limit has doubled.
 pub const REFUND_DAY_SECS: i64 = 86_400;
 
 /// Operator policy for refunds, read from the jailed config section.
@@ -142,12 +86,10 @@ impl RefundPolicy {
     /// Keys: `refund_window_secs`, `max_refund_per_day_base_units`, and
     /// `allow_partial_refunds`. All optional.
     ///
-    /// An explicit zero is honored on both numeric keys, because zero is
-    /// stricter than the default and is how an operator turns refunds off
-    /// without editing code. An absent or unparseable value falls back to
-    /// the default instead, since a typo must not silently disable a
-    /// shop's refunds any more than it must silently widen them; the
-    /// default is the conservative reading of "the operator did not say".
+    /// An explicit zero is honored on both numeric keys, since zero is
+    /// stricter than the default and is how an operator turns refunds off. An
+    /// absent or unparseable value falls back instead: a typo must not
+    /// silently disable refunds any more than widen them.
     ///
     /// The partial flag is true only for an explicit affirmative spelling.
     /// Anything else, including the word "maybe" and the empty string,
@@ -298,48 +240,20 @@ impl PreparedRefund {
 
 /// Prepare a refund for one order.
 ///
-/// The inputs are the order reference, the payments chain data showed
-/// arriving at the merchant, the shop config, the policy, the refunds
-/// already prepared, the merchant's own pubkey, a recent blockhash, and
-/// the clock. Nothing in that list is an amount or a destination, which
-/// is the point: there is no argument through which a caller can ask for
-/// a different sum or a different recipient, so no injected instruction
-/// can request one either.
+/// No argument here is an amount or a destination, so no injected
+/// instruction can request a different sum or recipient. `receipts` must
+/// come from `settle::parse_settlement_payment`, which derives each amount
+/// from a balance delta.
 ///
-/// `receipts` must come from `settle::parse_settlement_payment`, which
-/// computes each amount as a balance delta out of an RPC response. That
-/// is where the trust in the number actually lives; this module's
-/// contribution is that it adds no way to override it.
+/// Refuses on: wrong merchant, order never paid, an ambiguous tag from a
+/// cycled counter, wrong recipient or mint, an order already refunded,
+/// an unknown payer from a swap or router, a payment outside the refund
+/// window, and the daily ceiling.
 ///
-/// The refusals, in the order they are checked. The order is chosen so
-/// the message a human sees names the real problem rather than the first
-/// symptom of it.
-///
-/// - The merchant pubkey does not match the configured merchant.
-/// - No payment carries this order's tag: the order was never paid.
-/// - More than one does, which means the counter cycled while both were
-///   still on the books. Ambiguity near money is a human's decision.
-/// - The payment arrived somewhere other than the configured merchant,
-///   or in some mint other than the settlement mint.
-/// - The order was already refunded. This is the one that matters most:
-///   a double refund is a drain, so it is checked against the whole
-///   record list and not just today's.
-/// - The original payer cannot be determined, because the money came
-///   through a swap or a router with no single source account.
-/// - The payment falls outside the refund window, or carries no block
-///   time to place it in one.
-/// - The rolling daily ceiling would be exceeded.
-///
-/// The transaction always carries a `CreateIdempotent` for the
-/// destination token account. A customer who paid from a non-associated
-/// account, or who closed their account afterwards, has no account for
-/// the refund to land in, and `CreateIdempotent` succeeds either way, so
-/// including it unconditionally removes both an RPC round trip and the
-/// race between checking and creating. The cost is that when the account
-/// really is missing, the merchant pays its rent, about 0.00204 SOL, out
-/// of the signing wallet; that rent is recoverable only by the customer
-/// closing the account later. `render_approval` says so in the text the
-/// human approves.
+/// Always carries `CreateIdempotent` for the destination account, which
+/// removes a round trip and a race. When the account really is missing the
+/// merchant pays its rent, about 0.00204 SOL, and `render_approval` says
+/// so in the text the human approves.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_refund(
     order: OrderRef,
@@ -646,15 +560,10 @@ fn read_shortvec(bytes: &[u8], at: usize) -> Result<(usize, usize), String> {
 
 /// Parse a compiled refund message back into the facts it asserts.
 ///
-/// This is the function that makes human approval mean something, so it
-/// takes the same stance `vtx::verify_and_sign` takes: it refuses on the
-/// strength of the parsed bytes rather than on anyone's account of them.
-/// Anything that is not exactly one `TransferChecked`, optionally
-/// preceded by one `CreateIdempotent` for the same destination and mint,
-/// is refused outright. A refund transaction has no legitimate reason to
-/// carry a third instruction, and "there is an extra instruction I did
-/// not expect" is precisely the shape of an attack that a summary would
-/// paper over.
+/// Refuses on the strength of the parsed bytes, not anyone's account of
+/// them. Anything but one `TransferChecked`, optionally preceded by one
+/// `CreateIdempotent` for the same destination and mint, is refused: an
+/// unexpected third instruction is the shape of an attack.
 ///
 /// It is public so that a reviewer, a test, or a second implementation
 /// can check a refund's bytes without trusting anything this module says
@@ -960,20 +869,12 @@ fn check_message_matches(prepared: &PreparedRefund) -> Result<RefundMessageFacts
 
 /// Render the text a human approves a refund against.
 ///
-/// Everything above the dividing line is read back out of the bytes being
-/// signed by `parse_refund_message`, cross-checked against the facts this
-/// module derived, and printed from the parsed values rather than the
-/// derived ones. That ordering is deliberate: if the two ever diverge,
-/// this function refuses rather than rendering, and if they agree it is
-/// the bytes that reach the page. No caller supplies a string to this
-/// function, and no model-written text can reach it, because there is no
-/// argument for one.
+/// Everything above the line is read back out of the signable bytes by
+/// `parse_refund_message`, cross-checked, and printed from the parsed
+/// values. If the two diverge this refuses rather than renders.
 ///
-/// Below the line are the two facts that genuinely are not in the
-/// transaction, the originating payment signature and the order it
-/// settled. They are labelled as unverifiable against the bytes, because
-/// a human who cannot tell which claims were checked cannot weigh any of
-/// them.
+/// Below the line are the two facts not in the transaction, the payment
+/// signature and the order it settled, labelled as unverifiable.
 pub fn render_approval(prepared: &PreparedRefund) -> Result<String, String> {
     let facts = check_message_matches(prepared)?;
 

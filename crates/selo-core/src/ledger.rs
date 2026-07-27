@@ -1,66 +1,17 @@
 //! The daily ledger: confirmed transactions turned into accounting events.
 //!
-//! At daily close the shop hashes its ledger and anchors that hash on
-//! chain. An auditor who trusts nothing we say can re-derive the same
-//! ledger from the same chain data and check that it hashes to the same
-//! value. That check is only worth something if normalization is a pure
-//! function of chain state, so determinism here is not a nicety, it is
-//! the whole audit property.
+//! Normalization is a pure function of chain state, because the close
+//! hashes this and an auditor re-derives it. No number here is model
+//! authored; every amount is a difference between two integers the RPC
+//! reported.
 //!
-//! It is also the anti-tampering property, and that is the reason this
-//! module is written the way it is. A shop agent reads customer messages
-//! all day, which means it reads text an attacker wrote. If any number
-//! in the ledger were model authored, a persuasive message would be a
-//! path to a falsified book. No number here is model authored. Every
-//! amount is a difference between two integers the RPC reported, every
-//! address is copied out of the response, and the sort order is fixed by
-//! the data rather than by whatever order the node happened to serialize
-//! its arrays in. There is no argument to this module that a customer
-//! can influence, so there is no surface on which to lie.
+//! Three rules. Work from balance deltas, never the instruction list, so
+//! an unknown program cannot under-report. Attribute to the owner, not the
+//! token account. Emit `Unclassified` rather than dropping value.
 //!
-//! Three rules follow from that and are enforced throughout.
-//!
-//! Work from balance deltas, never from the instruction list. Decoding
-//! instructions means knowing every program that might move value, and
-//! the day a customer pays through a program we have never heard of the
-//! books would silently under-report. `meta.preBalances` against
-//! `meta.postBalances`, and `meta.preTokenBalances` against
-//! `meta.postTokenBalances`, are ground truth: they capture the net
-//! effect of the transaction whatever routed it.
-//!
-//! Attribute to the owner, not the token account. A merchant's
-//! associated token account is not their wallet, and a ledger row naming
-//! an ATA tells a human nothing. Token balance entries carry an `owner`
-//! field, and that is what a row is keyed on.
-//!
-//! Nothing that moved value is dropped. When a movement cannot be
-//! attributed, it is emitted as `EventKind::Unclassified` rather than
-//! skipped, because a book that quietly omits value it did not
-//! understand is worse than a book with an exception on it. An exception
-//! gets looked at; a silent omission does not.
-//!
-//! Determinism is achieved by construction, not by hoping. There is no
-//! `HashMap` in this module, because `HashMap` iteration order is
-//! unspecified and would leak into output; accumulation uses `BTreeMap`,
-//! which iterates in key order. There is no floating point, so no amount
-//! depends on rounding mode; token amounts are read from the integer
-//! `amount` string and the `uiAmount` float in the same response is
-//! deliberately never touched. There is no clock: the only time in an
-//! event is the block time the chain reported. And the final output is
-//! put through a total order over every field, so two runs on the same
-//! bytes cannot differ.
-//!
-//! One distinction is worth drawing, because it separates a real
-//! determinism bug from a test that asks for the impossible. The order
-//! of entries inside `preTokenBalances` and `postTokenBalances` is free:
-//! each entry names the account it describes, so a node may emit them in
-//! any order and the result must not move. The order of `accountKeys` is
-//! not free: position zero is the fee payer by protocol, and the token
-//! balance entries reference the other positions by index, so permuting
-//! that list describes a different transaction rather than the same one
-//! written differently. This module is indifferent to the first and
-//! reads the second exactly as the protocol defines it, and both
-//! properties are pinned by tests.
+//! Determinism by construction: `BTreeMap` not `HashMap`, no floating
+//! point, no clock, and a total order over every output field. Entry order
+//! within the balance arrays is free; `accountKeys` order is not.
 
 use std::collections::BTreeMap;
 
@@ -71,13 +22,10 @@ use crate::rpc::parse_result_value;
 
 /// The mint identifier used for native SOL.
 ///
-/// Deliberately not the wrapped SOL mint. Native lamports and wrapped
-/// SOL are different assets in a book: one is the account balance, the
-/// other is an SPL token that happens to track it, and a transaction can
-/// move both in opposite directions. Reusing the wSOL mint would net
-/// those two into one line and lose the distinction. `"SOL"` cannot
-/// collide with a real mint, because a mint is 32 bytes of base58 and
-/// this is three characters.
+/// Deliberately not the wrapped SOL mint. Native lamports and wSOL are
+/// different assets and a transaction can move both in opposite
+/// directions, so reusing the mint would net them into one line. `"SOL"`
+/// cannot collide: a mint is 32 bytes of base58, this is three chars.
 pub const NATIVE_SOL_MINT: &str = "SOL";
 
 /// What an event says happened to the merchant's money.
@@ -91,12 +39,10 @@ pub enum EventKind {
     Revenue,
     /// Value left the merchant.
     ///
-    /// A refund to a customer and a payout to a supplier are the same
-    /// shape in balance deltas, and this module has no order book with
-    /// which to tell them apart. Rather than guess, it records that
-    /// value left and leaves the business classification to a later step
-    /// that can match the amount against an issued quote. Guessing here
-    /// would put a number in the book that no auditor could re-derive.
+    /// A refund and a supplier payout are the same shape in balance deltas,
+    /// and this module has no order book to tell them apart. It records that
+    /// value left and leaves the classification to a step that can match
+    /// against an issued quote. Guessing would put an unre-derivable number in.
     Payout,
     /// Network fee the merchant paid.
     FeePaid,
@@ -120,11 +66,9 @@ impl EventKind {
 
 /// One normalized accounting event.
 ///
-/// Amounts are signed from the merchant's point of view and are always
-/// in the mint's smallest unit: positive means value arrived, negative
-/// means value left. `i128` rather than `i64` because a delta on a mint
-/// with large supply and few decimals can exceed `u64` when subtracted,
-/// and because there is no reason to court an overflow in a book.
+/// Signed from the merchant's point of view, always in the mint's smallest
+/// unit: positive arrived, negative left. `i128` because a delta on a
+/// large-supply mint can exceed `u64` when subtracted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerEvent {
     /// The transaction this event was derived from.
@@ -201,11 +145,10 @@ pub fn sort_events(events: &mut [LedgerEvent]) {
 /// is matched on the `owner` field of the token balance entries, so an
 /// ATA the shop has never enumerated still books correctly.
 ///
-/// A response whose `result` is null is an error rather than an empty
-/// day. The signature came from the chain in the first place, so a node
-/// that cannot return it is a node outside its retention window, and a
-/// ledger silently missing a transaction would still hash cleanly and
-/// still be wrong.
+/// A null `result` is an error, not an empty day. The signature came from
+/// the chain, so a node that cannot return it is outside its retention
+/// window, and a ledger silently missing a transaction still hashes
+/// cleanly and is still wrong.
 pub fn normalize_transaction(
     merchant_owner: &str,
     signature: &str,
@@ -280,11 +223,9 @@ pub fn normalize_transaction(
 
 /// Normalize a batch of transactions into one ordered ledger.
 ///
-/// Each element is a signature and the raw `getTransaction` body for it.
-/// The result is sorted across the whole batch, so the order in which
-/// the caller fetched transactions cannot reach the output. That matters
-/// because the caller fetches over a network, and network order is not
-/// something an auditor can reproduce.
+/// Each element is a signature and its raw `getTransaction` body. Sorted
+/// across the whole batch, so the order the caller fetched in cannot reach
+/// the output. Network order is not something an auditor can reproduce.
 pub fn normalize_transactions(
     merchant_owner: &str,
     responses: &[(String, String)],
@@ -319,23 +260,12 @@ fn account_keys(result: &Value) -> Vec<String> {
 
 /// Native SOL movement, with the fee netted out of the fee payer.
 ///
-/// This is where the double counting question is settled. The fee is
-/// already inside the fee payer's SOL delta: `postBalances[0]` has it
-/// subtracted. So the fee is added back to that account's delta before
-/// classification, and accounted for once as its own `FeePaid` event.
-/// The consequence is worth stating precisely, because a reconciliation
-/// depends on it: for the fee payer, the `FeePaid` amount plus the SOL
-/// event amount equals the raw delta the RPC reported, exactly. Nothing
-/// is counted twice and nothing is lost.
+/// The fee is already inside the fee payer's delta, so it is added back
+/// before classification and accounted once as `FeePaid`. For the fee
+/// payer, `FeePaid` plus the SOL event equals the raw delta exactly.
 ///
-/// The alternative, leaving the fee inside the SOL event, was rejected
-/// because it makes a fee look like a tiny disposal of SOL and a shop
-/// that paid ten thousand fees would show ten thousand phantom payouts.
-/// A fee is a cost of doing business and belongs on its own line.
-///
-/// A residual of zero emits nothing: a transaction where the merchant
-/// only paid the fee produces one `FeePaid` event and no SOL line,
-/// rather than a line saying zero moved.
+/// Leaving it inside would make every fee look like a tiny disposal of
+/// SOL. A residual of zero emits nothing.
 fn sol_events(
     meta: &Value,
     account_keys: &[String],
@@ -398,11 +328,10 @@ fn sol_events(
 
 /// SPL movement, netted per owner and mint.
 ///
-/// Netting by owner and mint rather than by token account is what makes
-/// the result independent of how many accounts a wallet holds for one
-/// mint, and it handles an ATA created inside the transaction, which
-/// appears only in `postTokenBalances`, without a special case: the
-/// missing side simply contributes nothing.
+/// Netting by owner and mint, not token account, makes the result
+/// independent of how many accounts a wallet holds for one mint. It also
+/// handles an ATA created inside the transaction without a special case:
+/// the missing side contributes nothing.
 fn token_events(
     meta: &Value,
     merchant: &str,
@@ -507,10 +436,9 @@ fn token_balances(meta: &Value, key: &str) -> Vec<Value> {
 
 /// Read a token amount as an integer.
 ///
-/// The `amount` field is a decimal string of base units and is the only
-/// field read. The sibling `uiAmount` is a JSON float, and a float is
-/// not a thing to keep money in: it cannot represent every base unit of
-/// a nine decimal mint, so a book built on it would drift by amounts too
+/// `amount` is a decimal string of base units and the only field read.
+/// The sibling `uiAmount` is a float, which cannot represent every base
+/// unit of a nine decimal mint, so a book on it would drift by amounts too
 /// small to notice and too real to ignore.
 fn token_amount(entry: &Value) -> Result<i128, String> {
     let raw = entry

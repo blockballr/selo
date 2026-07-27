@@ -104,11 +104,9 @@ pub struct PriorityFee {
 /// Build a transfer message, optionally prefixed with compute budget
 /// instructions that bid for block inclusion.
 ///
-/// The compute budget instructions must come before the transfer, and
-/// adding them changes the account layout: the ComputeBudget program
-/// becomes a fourth key and the readonly-unsigned count rises to two.
-/// Getting that count wrong makes the runtime treat the wrong accounts
-/// as writable, so it is derived here rather than hardcoded per shape.
+/// Compute budget instructions come before the transfer, and adding them
+/// changes the account layout: ComputeBudget becomes a fourth key and the
+/// readonly-unsigned count rises to two. Derived here, not hardcoded.
 pub fn build_transfer_message_with_priority(
     from: &[u8; 32],
     to: &str,

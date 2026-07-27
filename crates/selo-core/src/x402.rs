@@ -1,23 +1,10 @@
 //! x402 agent payments on Solana: the `exact` scheme.
 //!
-//! When an HTTP resource replies `402 Payment Required`, it carries an
-//! `accepts` array of payment options. For the Solana `exact` scheme the
-//! client must build a partially-signed versioned transaction that transfers
-//! a fixed amount of an SPL token to the server, sign only its own slot, and
-//! send it back base64-encoded in the `X-PAYMENT` header. A facilitator
-//! fills the fee-payer signature and submits it on chain.
+//! Parses and validates the server's `402` requirements, selects a payable
+//! option, and encodes the `X-PAYMENT` envelope. Building and signing the
+//! transaction is deliberately elsewhere; see the note at the foot.
 //!
-//! This module owns the pure, natively testable half of that exchange: it
-//! parses and validates the server's requirements, selects a payable option,
-//! and encodes the `X-PAYMENT` header envelope. Building and signing the
-//! transaction itself is deliberately kept separate (see the design note at
-//! the foot of this file) because it composes the ComputeBudget and
-//! TransferChecked instruction builders that already live in `priority` and
-//! `token`, and its correctness is verified against on-chain simulation
-//! rather than against a captured string.
-//!
-//! Field names follow the Coinbase x402 SVM `exact` scheme spec:
-//! `specs/schemes/exact/scheme_exact_svm.md`.
+//! Field names follow `specs/schemes/exact/scheme_exact_svm.md`.
 
 use serde::Deserialize;
 
@@ -108,11 +95,9 @@ impl PaymentRequirements {
 
 /// Parse a `402` body and choose the option this client can pay.
 ///
-/// A payable option is `exact` scheme, on the requested `network`, and when
-/// `asset` is given, in that token. The first matching option wins, matching
-/// how servers order `accepts` by preference. The caller passes the network
-/// and, optionally, the mint it is willing to spend, so this never silently
-/// pays in an unexpected token.
+/// A payable option is `exact` scheme, on the requested `network`, and in
+/// `asset` when given. First match wins, matching how servers order
+/// `accepts` by preference, so this never silently pays in another token.
 pub fn select_exact(
     body: &str,
     network: &str,

@@ -1,7 +1,7 @@
 // Dev helper: parse a base64 transaction and report its structure.
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use solana_plugin_core::address::encode_pubkey;
-use solana_plugin_core::vtx::parse_transaction;
+use selo_core::address::encode_pubkey;
+use selo_core::vtx::parse_transaction;
 
 fn main() {
     let b64 = std::env::args().nth(1).unwrap();

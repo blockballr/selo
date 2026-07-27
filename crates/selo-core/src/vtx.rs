@@ -1,19 +1,8 @@
 //! Versioned (v0) transaction parsing and signing.
 //!
-//! Aggregators like Jupiter return a fully built transaction that the
-//! caller only has to sign. That sounds simple and is the single most
-//! dangerous thing in this crate: signing an opaque blob means signing
-//! whatever someone else put in it. So rather than blindly stamping a
-//! signature onto bytes from the network, this module parses the
-//! transaction far enough to check the claims that matter, above all
-//! that the fee payer really is our wallet and that our signature is
-//! the only one being asked for.
-//!
-//! The v0 format differs from legacy in two ways. A leading byte with
-//! the high bit set marks the version, and the message ends with a list
-//! of address table lookups, which is how a transaction references more
-//! accounts than would fit inline. Those lookups are what makes a
-//! Jupiter route fit in one transaction at all.
+//! Signing a blob an aggregator built is signing whatever they put in it,
+//! so this parses far enough to check the fee payer is our wallet and that
+//! ours is the only signature asked for.
 
 use crate::address::encode_pubkey;
 

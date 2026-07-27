@@ -1,29 +1,11 @@
 //! The append-only record of what was quoted.
 //!
-//! A payment amount identifies which order it paid for, but it cannot
-//! say what was in that order. "Ten dollars arrived from terminal three,
-//! order forty seven" is settlement; "two bags of rice" is the sale. The
-//! second half lives here.
+//! The amount says which order was paid; this says what was in it.
 //!
-//! Append-only is the whole design, and the reason is adversarial rather
-//! than architectural. The agent talks to strangers, so an injected
-//! instruction may arrive at any point in a day. If the record of what
-//! was sold could be edited after the fact, an attacker who reached the
-//! agent at closing time could rewrite the morning: reprice sales that
-//! already settled, delete ones that embarrass a total, or invent ones
-//! that never happened. Writing each line once, at the instant the quote
-//! is issued and from the catalog rather than from anything a customer
-//! said, removes that window. There is no mutation path to attack
-//! because this module exposes none.
-//!
-//! What remains possible is appending a false line going forward, and
-//! that is bounded elsewhere: prices come from operator config, so a new
-//! line can only ever name a catalog item at its catalog price.
-//!
-//! The log is also the input to the daily close. Because entries are
-//! immutable and ordered, the close is a pure function of this log and
-//! chain state, which is what lets an auditor re-derive the day and
-//! check it against the anchored commitment.
+//! Append-only is adversarial, not architectural. If the record could be
+//! edited, an injection reaching the agent at closing time could reprice
+//! or delete the morning. This module exposes no mutation path. Appending
+//! a false line forward is bounded by prices coming from operator config.
 
 use std::collections::BTreeMap;
 

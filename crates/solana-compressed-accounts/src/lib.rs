@@ -26,9 +26,9 @@ mod component {
 
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
-    use solana_plugin_core::config::RpcConfig;
-    use solana_plugin_core::format::{render_compressed_accounts, VerifiedAccount};
-    use solana_plugin_core::zk;
+    use selo_core::config::RpcConfig;
+    use selo_core::format::{render_compressed_accounts, VerifiedAccount};
+    use selo_core::zk;
     use zeroclaw::plugin::logging::{
         log_record, LogLevel, PluginAction, PluginEvent, PluginOutcome,
     };

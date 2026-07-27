@@ -1,18 +1,11 @@
 //! SPL token transfers.
 //!
-//! Sending USDC is the transfer people actually make, and it is a
-//! materially harder transaction than sending SOL. Tokens do not live
-//! at a wallet address; they live in a token account owned by that
-//! wallet, canonically the associated token account derived in `pda`.
-//! So a transfer has to derive both sides, and if the recipient has
-//! never held this mint, their account does not exist yet and must be
-//! created in the same transaction.
+//! Tokens live in an account owned by the wallet, so a transfer derives
+//! both sides and creates the recipient's if it does not exist.
 //!
-//! `TransferChecked` is used rather than the older `Transfer` because
-//! it carries the mint and its decimals, so the token program rejects a
-//! transfer whose decimals do not match the mint. That turns a whole
-//! class of "sent a thousand times too much" bugs into a failed
-//! transaction.
+//! `TransferChecked` rather than `Transfer`: it carries the mint decimals,
+//! so a mismatch fails the transaction instead of sending a thousand times
+//! too much.
 
 use serde_json::{json, Value};
 

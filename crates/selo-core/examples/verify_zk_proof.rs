@@ -1,5 +1,5 @@
 // Dev helper: verify a real getCompressedAccountProof response.
-use solana_plugin_core::zk;
+use selo_core::zk;
 
 fn main() {
     let body = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();

@@ -1,8 +1,8 @@
 // Dev helper: emit a base64 token transfer transaction for simulation.
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use solana_plugin_core::address::decode_pubkey;
-use solana_plugin_core::token::TokenTransfer;
-use solana_plugin_core::transfer::shortvec;
+use selo_core::address::decode_pubkey;
+use selo_core::token::TokenTransfer;
+use selo_core::transfer::shortvec;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

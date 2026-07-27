@@ -1,38 +1,14 @@
 //! Quotes, and the payment amount encoding that makes them matchable.
 //!
-//! The agent holds no signing key, so it cannot sweep funds and every
-//! sale lands at one fixed merchant address. That leaves a problem: a
-//! stream of transfers arrives at a single account and something has to
-//! decide which order each one paid for, without a database the shop
-//! has to run and without asking the customer to attach a memo their
-//! wallet may not even expose.
+//! Every sale lands at one fixed address, so something must decide which
+//! order each transfer paid for without a database or a wallet-dependent
+//! memo. The amount carries it: the digits below a cent are unused, so two
+//! name the sales point and two the order counter.
 //!
-//! The amount itself carries it. A price is cent-granular, but the mint
-//! has more precision than that, and the digits below a cent are unused.
-//! So the quote spends them deliberately: two digits name the sales
-//! point, two more the order counter. Terminal 3's forty-seventh order
-//! on a ten dollar total is quoted as 10.000347, and the payment that
-//! arrives is self-identifying.
-//!
-//! Two consequences are worth naming because they are the reason for
-//! this design rather than a random cents nonce.
-//!
-//! Collisions are removed structurally rather than made unlikely. Two
-//! sales points cannot issue the same amount, because the sales point
-//! is part of the number. Within one sales point the counter is what
-//! distinguishes concurrent orders, so the only real constraint is that
-//! a terminal must not have more open quotes at once than the counter
-//! has room for, which `MAX_OPEN_PER_SALES_POINT` states and callers
-//! enforce.
-//!
-//! Reconciliation per sales point becomes derivable from chain data
-//! alone. An auditor who never sees our records can still attribute
-//! every payment to the terminal that made the sale, because the
-//! attribution is in the transfer amount rather than in a file we could
-//! have edited.
-//!
-//! The cost to the customer is at most one cent, and in practice a tiny
-//! fraction of one: the tag on a six-decimal mint is under 0.01 units.
+//! Collisions go structurally, not probabilistically: the sales point is
+//! part of the number, and within one the counter bounds concurrency at
+//! `MAX_OPEN_PER_SALES_POINT`. The tag costs the customer under 0.01
+//! units on a six-decimal mint.
 
 /// Digits reserved at the bottom of the amount for the tag.
 ///
@@ -93,12 +69,10 @@ impl AmountTag {
 /// Add the tag to a cent-granular price, giving the exact amount the
 /// customer is asked to send.
 ///
-/// `price_base_units` is the price in the mint's smallest unit and must
-/// be a whole number of cents, meaning divisible by `TAG_SCALE`. A price
-/// carrying digits of its own below a cent would be overwritten by the
-/// tag, so that is refused rather than silently rounded: quoting a
-/// customer a different number than the catalog holds is exactly the
-/// class of bug this module exists to prevent.
+/// `price_base_units` must be a whole number of cents, divisible by
+/// `TAG_SCALE`. A price with digits of its own below a cent would be
+/// overwritten by the tag, so it is refused rather than rounded: quoting a
+/// different number than the catalog holds is the bug this prevents.
 pub fn encode_amount(price_base_units: u64, tag: AmountTag) -> Result<u64, String> {
     if price_base_units == 0 {
         return Err("a quote for zero is not a sale".to_string());
@@ -116,11 +90,9 @@ pub fn encode_amount(price_base_units: u64, tag: AmountTag) -> Result<u64, Strin
 
 /// Recover the price and the tag from an amount that arrived on chain.
 ///
-/// Returns `Ok(None)` when the low digits carry no sales point, which
-/// means this transfer did not come from a quote we issued. That is a
-/// normal event, someone sending a round number to the shop address, and
-/// it belongs in the exceptions queue rather than being reported as an
-/// error.
+/// `Ok(None)` when the low digits carry no sales point, meaning the
+/// transfer did not come from a quote we issued. That is normal, someone
+/// sending a round number, and belongs in the exceptions queue.
 pub fn decode_amount(amount_base_units: u64) -> Result<Option<(u64, AmountTag)>, String> {
     let tag_value = amount_base_units % TAG_SCALE;
     let price = amount_base_units - tag_value;

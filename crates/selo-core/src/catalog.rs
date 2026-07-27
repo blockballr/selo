@@ -1,25 +1,11 @@
 //! The shop catalog and the settlement addresses, read from config.
 //!
-//! This module is where the agent's authority over money stops. Prices
-//! live here, in operator-controlled config, and nowhere else. The model
-//! chooses which item a customer is asking about; it has no way to say
-//! what that item costs, because no function here accepts a price as an
-//! argument. An injected instruction to apply a discount has nothing to
-//! act on: there is no discount parameter to set.
+//! Where the agent's authority over money stops. No function here accepts
+//! a price or the merchant address as an argument; both come from the
+//! jailed config section, so an injected discount has nothing to set.
 //!
-//! The same reasoning covers the merchant address, and there it matters
-//! more than anywhere else in the system. If a persuasive message could
-//! change the address customers are told to pay, the shop would lose
-//! every sale that day and the loss would look like ordinary business
-//! until reconciliation. So the address is read from the jailed config
-//! section and there is deliberately no code path, anywhere, that takes
-//! it from tool arguments.
-//!
-//! Unlike `RpcConfig`, this config fails closed. An absent RPC URL can
-//! sensibly fall back to a public endpoint; an absent catalog cannot
-//! sensibly fall back to anything, because a shop with no configured
-//! prices should sell nothing rather than sell at a guess. Every missing
-//! or malformed field is an error, not a default.
+//! Unlike `RpcConfig` this fails closed. A shop with no configured prices
+//! should sell nothing rather than sell at a guess.
 
 use std::collections::HashMap;
 
@@ -46,11 +32,9 @@ pub struct Catalog {
 impl Catalog {
     /// Parse the catalog from the jailed config section.
     ///
-    /// The `catalog` key holds a JSON array of objects with `sku`, `name`
-    /// and `price`, where price is a decimal string in whole currency
-    /// units such as `"10.00"`. Prices are converted against `decimals`
-    /// here so that the rest of the system deals only in base units and
-    /// never re-parses a human number.
+    /// The `catalog` key holds a JSON array of `sku`, `name` and `price`,
+    /// price being a decimal string in whole units like `"10.00"`. Converted
+    /// against `decimals` here, so the rest of the system sees only base units.
     pub fn from_section(
         section: &HashMap<String, String>,
         decimals: u8,

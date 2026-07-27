@@ -1,20 +1,9 @@
 //! Priority fees and compute budget instructions.
 //!
-//! Solana charges a flat base fee per signature, which does not change
-//! with demand. Priority fees are the actual bidding mechanism: an
-//! optional price per compute unit that decides how a leader orders
-//! transactions when a block is full. Getting this wrong is expensive
-//! in both directions, a transaction that never lands or one that
-//! overpays by orders of magnitude.
-//!
-//! The subtlety worth stating: recent fee samples are mostly zero even
-//! when the network is busy, because most accounts are uncontended. In
-//! a live sample of 150 slots for a busy mint, the median was zero and
-//! the maximum was over six million micro-lamports. So a median is
-//! useless as a recommendation. This module works from percentiles of
-//! the observed distribution and lets the caller pick urgency, and it
-//! always reports what the fee will actually cost in SOL rather than in
-//! micro-lamports per compute unit, which nobody can reason about.
+//! Recent fee samples are mostly zero even on a busy network, because most
+//! accounts are uncontended, so a median is useless as a recommendation.
+//! This works from percentiles and reports the cost in SOL rather than in
+//! micro-lamports per compute unit.
 
 use serde_json::{json, Value};
 
@@ -133,12 +122,10 @@ fn percentile_of(sorted: &[u64], p: f64) -> u64 {
 
 /// Parse the fee samples and produce a recommendation.
 ///
-/// Percentiles are taken over the non-zero samples when any exist. The
-/// reason is the distribution described at the top of this module: with
-/// most samples at zero, a percentile over everything collapses to zero
-/// and would recommend not bidding at all during exactly the congestion
-/// it is supposed to handle. When every sample is zero the network is
-/// genuinely idle for these accounts and zero is the honest answer.
+/// Percentiles over the non-zero samples when any exist. With most samples
+/// at zero, a percentile over everything collapses to zero and recommends
+/// not bidding during exactly the congestion it handles. All zero means the
+/// network is genuinely idle and zero is honest.
 pub fn parse_fees(
     body: &str,
     urgency: Urgency,

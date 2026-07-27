@@ -1,104 +1,11 @@
 //! The daily close: a day of trading turned into one hashable record.
 //!
-//! Settlement decides that a payment happened. The ledger normalizes what
-//! moved. Neither of them says what was sold, because chain data does not
-//! carry a sku. This module joins the two halves: it takes the sales the
-//! chain proves were paid and the quote log's record of what each of those
-//! orders contained, and produces a single canonical, itemized record of
-//! the day plus a commitment to it that can be anchored on chain.
+//! Byte-identical output for identical input, so an auditor can re-derive
+//! the day from chain data and the quote log and get the same hash. Nothing
+//! here is model authored, and disagreements refuse rather than resolve.
 //!
-//! Why determinism is the point, and not a nicety. The whole value of an
-//! anchor is that an auditor who trusts nothing the shop says can go to
-//! the chain, re-derive the day from the same transactions, and check that
-//! it hashes to the value the shop published. That check means something
-//! only if the derivation is a pure function of chain state and the quote
-//! log. So byte-identical output for identical input is the audit
-//! property, restated.
-//!
-//! It is simultaneously the anti-tampering property, which is the reason
-//! it is enforced this hard. The shop agent reads customer messages all
-//! day, which means it reads text an attacker wrote. If any number in the
-//! close were model authored, or if the output depended on the order in
-//! which the agent happened to fetch things, then a persuasive message at
-//! closing time would be a path to a falsified book. Nothing here is
-//! model authored. Every amount is copied from a `ConfirmedSale` that came
-//! out of a balance delta, every price is copied from a `QuoteEntry` that
-//! was written at issuance from operator config, and the output is put
-//! through a total order over every field so the input order cannot reach
-//! it. A prompt-injected agent can choose which day to close. It has no
-//! surface on which to change what that day contains.
-//!
-//! The same reasoning explains the refusals. Where two records disagree,
-//! or where a sale has no quote behind it, this module stops rather than
-//! picking one. A close that silently resolved a disagreement would be
-//! publishing a number no auditor could re-derive, which is worse than
-//! publishing nothing.
-//!
-//! # Which hash, and why
-//!
-//! Poseidon over BN254, through `zk::hash_pair`, rather than a bare
-//! SHA-256 of the record text. The commitment is meant to live in a ZK
-//! compression context, where state is a Poseidon merkle tree and a proof
-//! about that state is checked inside a circuit. A SHA-256 digest is
-//! enormously expensive to prove in a BN254 circuit, so committing with
-//! SHA-256 would produce a number that is anchorable but not usefully
-//! provable, which defeats the reason for anchoring it there.
-//!
-//! Poseidon does not take arbitrary bytes, though. It operates on BN254
-//! field elements, and a canonical line is variable length UTF-8. The
-//! bridge between the two is the standard one, and the one Light Protocol
-//! itself uses in `hash_to_bn254_field_size_be`: hash the bytes with
-//! SHA-256, then force the digest below the field modulus by zeroing its
-//! leading byte. That leaves a 248 bit value, and 2^248 is comfortably
-//! below the BN254 scalar modulus of roughly 2^253.5, so every possible
-//! input maps to a valid field element on the first try. No rejection
-//! loop, no input-dependent branch, no way for one input to have two
-//! images. SHA-256 appears here only as that embedding; the commitment
-//! itself is Poseidon throughout.
-//!
-//! The lines are then folded into a Poseidon merkle tree rather than
-//! hashed as one blob, which buys something a flat hash does not: an
-//! auditor can be shown that one specific sale is in the anchored day,
-//! with a proof `zk::verify_proof` already checks, without being handed
-//! the rest of the day. The tree root is finally bound to a header
-//! element carrying the merchant, the day bounds, and the line count, so
-//! one day's root cannot be replayed as another day's and the padding
-//! used to square the tree cannot be reinterpreted as extra sales.
-//!
-//! # Privacy is enforced here, not assumed
-//!
-//! Under ZK compression the committed data is public through the indexer.
-//! Anything that reaches the anchored record is world readable and cannot
-//! be withdrawn. Customer identity therefore must never enter it: no
-//! phone numbers, no names, no message content.
-//!
-//! A property that holds only while nobody makes a mistake is not a
-//! property, so it is enforced structurally and then checked. Structurally,
-//! the record has exactly one free text field. The signature is validated
-//! as a 64 byte base58 signature, the mint as a 32 byte base58 pubkey, and
-//! everything else is an integer, so none of those can carry a sentence at
-//! all. That leaves the sku, which comes from operator config rather than
-//! from customer text, and the sku is scanned by `reject_identity_shaped`
-//! before any line is built.
-//!
-//! The scan is deliberately biased towards false positives. A run of seven
-//! or more digits, counted across the separators a written phone number
-//! uses, is refused, as is an `@` and any control character. A catalog
-//! entry named "SKU-1234567" will therefore fail to close, and that is the
-//! intended trade: a refused close is a human looking at a config file for
-//! five minutes, while a leaked phone number is permanent and public.
-//!
-//! What the scan does not claim to do is detect a name. There is no
-//! mechanical test for one. The defence against a name is the structural
-//! half above: there is no field for it to go in, and the one free text
-//! field is not reachable from customer input.
-//!
-//! Wallet addresses are not treated as identity. The payer already signed
-//! a public transaction, so its address is on chain by nature of the
-//! payment and republishing it reveals nothing new. It is left out of the
-//! record all the same, for a different reason: the signature already
-//! points at the transaction that names it, so carrying the payer would
-//! add data without adding a fact.
+//! Poseidon over BN254 rather than SHA-256: the commitment is meant to be
+//! provable inside a BN254 circuit, where a SHA-256 digest is ruinous.
 
 use sha2::{Digest, Sha256};
 
@@ -112,12 +19,10 @@ use crate::zk::hash_pair;
 
 /// Version tag for the canonical form.
 ///
-/// It is the first thing in the header line and the first thing in the
-/// anchor memo, and it is part of the commitment. Anything that changes
-/// the field order, the separators, or the hashing has to change this
-/// too, because otherwise two incompatible schemes would produce numbers
-/// that look interchangeable and are not.
-pub const CLOSE_DOMAIN: &str = "daybook-close-v1";
+/// First thing in the header line and the anchor memo, and part of the
+/// commitment. Anything changing field order, separators or hashing must
+/// change this too, or two schemes produce interchangeable-looking numbers.
+pub const CLOSE_DOMAIN: &str = "selo-close-v1";
 
 /// The SPL Memo program, version three.
 ///
@@ -200,11 +105,9 @@ impl CloseLine {
 
     /// The line as one canonical line of text.
     ///
-    /// Tab separated, fields in this order, integers in base ten with no
-    /// separators. This is the form that gets hashed, so it is fixed:
-    /// anything that changes it changes every historical anchor. The tab
-    /// is safe as a separator only because `reject_identity_shaped`
-    /// refuses a sku containing one.
+    /// Tab separated, this field order, integers base ten. This is what gets
+    /// hashed, so changing it changes every historical anchor. The tab is safe
+    /// only because `reject_identity_shaped` refuses a sku containing one.
     pub fn canonical_line(&self) -> String {
         format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -354,34 +257,17 @@ pub struct PreparedAnchor {
 
 /// Turn a day's confirmed sales and quote entries into a closed day.
 ///
-/// The inputs are the merchant, the day's bounds, the sales the chain
-/// proved, and the quote log. There is no amount argument, no total, and
-/// no override, which is the same stance `settle` and `refund` take: the
-/// caller chooses which day to close and the code decides what is in it.
+/// No amount, total or override argument: the caller chooses which day,
+/// the code decides what is in it.
 ///
-/// The window is checked rather than applied. A sale outside it is an
-/// error, not a line quietly dropped, because a close that filtered by
-/// its own bounds would let a caller shrink a day by moving them and hide
-/// money in the gap. The mismatch is made visible instead.
+/// The window is checked, not applied. A sale outside it is an error
+/// rather than a line quietly dropped, or a caller could shrink a day and
+/// hide money in the gap.
 ///
-/// The refusals, in the order they are checked:
-///
-/// - The merchant is not a valid address.
-/// - The day's bounds are not a forward interval.
-/// - There are more sales than `MAX_CLOSE_LINES`.
-/// - A sale carries no block time, so it cannot be placed in any day.
-/// - A sale falls outside the stated window.
-/// - Two sales share a signature, which would count one payment twice.
-/// - No quote entry matches a sale's order reference and amount, so there
-///   is no record of what was sold.
-/// - The matching quote entries disagree with each other about the item.
-/// - The quote entry and the chain disagree about the sku or the quantity.
-///   The sale's sku was copied from the quote at match time, so a
-///   disagreement means one of the two records was altered afterwards.
-/// - The itemization does not reconcile: quantity times unit price plus
-///   the order's tag must equal the amount the chain shows, exactly.
-/// - A sku is identity shaped, empty, over length, or carries a character
-///   that would break the canonical form.
+/// Refuses on: invalid merchant, backwards interval, over
+/// `MAX_CLOSE_LINES`, a sale with no block time or outside the window, a
+/// duplicate signature, a sale with no matching quote, quote entries that
+/// disagree, an itemization that does not reconcile, a malformed sku.
 pub fn build_close(
     merchant: &str,
     day_start_unix: i64,
@@ -559,11 +445,10 @@ pub fn reject_identity_shaped(field: &str, value: &str) -> Result<(), String> {
 
 /// Map arbitrary bytes onto a BN254 field element.
 ///
-/// SHA-256 for the compression, then the leading byte is zeroed so the
-/// result is below 2^248 and therefore below the field modulus. Every
-/// input maps on the first attempt, so the mapping is total and carries
-/// no input-dependent branch. See the module documentation for why this
-/// is the embedding rather than the commitment.
+/// SHA-256, then the leading byte zeroed so the result is below the field
+/// modulus. Every input maps on the first attempt, so the mapping is total
+/// with no input-dependent branch. See the module doc for why this is the
+/// embedding rather than the commitment.
 pub fn field_element(bytes: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(bytes);
     let mut out = [0u8; 32];

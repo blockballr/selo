@@ -8,7 +8,7 @@ description = "ZeroClaw tool plugin: read ZK compressed accounts and verify thei
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-solana-plugin-core = { path = "../solana-plugin-core" }
+selo-core = { path = "../selo-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

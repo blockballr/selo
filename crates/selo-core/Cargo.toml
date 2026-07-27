@@ -1,8 +1,8 @@
 [package]
-name = "solana-plugin-core"
+name = "selo-core"
 version.workspace = true
 edition.workspace = true
-description = "Pure Solana JSON-RPC logic shared by the ZeroClaw plugin suite. No I/O, natively testable."
+description = "Selo's core money path: quoting, settlement, ledger, period close and cost basis. No I/O, natively testable."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -12,10 +12,6 @@ base64 = "0.22"
 ed25519-dalek = "2"
 sha2 = "0.10"
 curve25519-dalek = "4"
-light-poseidon = "0.4"
-ark-bn254 = "0.5"
 
 [dev-dependencies]
-base64 = "0.22"
-ed25519-dalek = "2"
 bs58 = "0.5"
