@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/selo-core",
-    "crates/daybook-shop",
+    "crates/selo-tool"
 ]
 
 [workspace.package]

@@ -1,5 +1,5 @@
 [package]
-name = "daybook-shop"
+name = "selo-tool"
 version.workspace = true
 edition.workspace = true
 description = "ZeroClaw tool plugin for daybook: quote catalog items, confirm on-chain payment, and close the day."
