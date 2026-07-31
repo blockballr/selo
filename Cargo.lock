@@ -121,17 +121,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "daybook-shop"
-version = "0.1.0"
-dependencies = [
- "selo-core",
- "serde",
- "serde_json",
- "waki",
- "wit-bindgen 0.46.0",
-]
-
-[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -490,6 +479,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "selo-tool"
+version = "0.1.0"
+dependencies = [
+ "selo-core",
+ "serde",
+ "serde_json",
+ "waki",
+ "wit-bindgen 0.46.0",
 ]
 
 [[package]]
