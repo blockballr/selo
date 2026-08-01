@@ -4,17 +4,12 @@ version.workspace = true
 edition.workspace = true
 description = "ZeroClaw tool plugin for daybook: quote catalog items, confirm on-chain payment, and close the day."
 
-# cdylib is the component build; rlib lets the crate's native tests compile.
-[lib]
-crate-type = ["cdylib", "rlib"]
+[[bin]]
+name = "selo-tool"
+path = "src/main.rs"
 
 [dependencies]
 selo-core = { path = "../selo-core" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Guest-side bindings and the wasi:http client exist only for the
-# component target, so the pure-logic path stays natively testable.
-[target.'cfg(target_family = "wasm")'.dependencies]
-wit-bindgen = "0.46"
-waki = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "3.0", features = ["json"] }
