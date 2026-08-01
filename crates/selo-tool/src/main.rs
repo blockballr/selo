@@ -16,8 +16,9 @@ fn main() -> Result<(), String> {
         println!("  blockhash              Fetch latest blockhash");
         return Ok(());
     }
-    let rpc_url =
-        env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
+
+    let rpc_url = env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
 
     let rpc = ToolRpc::new(&rpc_url);
     let engine = AccountingEngine::new(rpc);
