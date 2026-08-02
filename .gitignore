@@ -1,4 +1,6 @@
 /target
+.selo_store.json
+.selo_rules.json
 /dist
 Cargo.lock.bak
 Cargo.lock

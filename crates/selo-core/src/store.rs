@@ -1,6 +1,6 @@
-//! local quote store schemas
+//! # local Quote Store Schemas
 //!
-//! defines data structures for active quote records and settlement status.
+//! defines the data structures for active quote records, settlement status, and expiry lifecycle.
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,14 @@ pub struct SeloStore {
     pub version: u32,
     pub updated_at: u64,
     pub quotes: Vec<QuoteRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreSummary {
+    pub total: usize,
+    pub pending: usize,
+    pub settled: usize,
+    pub expired: usize,
 }
 
 impl SeloStore {
@@ -66,5 +74,80 @@ impl SeloStore {
             }
         }
         false
+    }
+
+    pub fn prune_expired(&mut self, now_unix: u64) -> usize {
+        let mut expired_count = 0;
+        for quote in self.quotes.iter_mut() {
+            if matches!(quote.status, QuoteStatus::Pending) && now_unix >= quote.expires_at {
+                quote.status = QuoteStatus::Expired;
+                expired_count += 1;
+            }
+        }
+        expired_count
+    }
+
+    pub fn get_summary(&self) -> StoreSummary {
+        let mut summary = StoreSummary {
+            total: self.quotes.len(),
+            pending: 0,
+            settled: 0,
+            expired: 0,
+        };
+
+        for q in &self.quotes {
+            match q.status {
+                QuoteStatus::Pending => summary.pending += 1,
+                QuoteStatus::Settled { .. } => summary.settled += 1,
+                QuoteStatus::Expired => summary.expired += 1,
+            }
+        }
+
+        summary
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prune_expired_quotes() {
+        let mut store = SeloStore::new();
+        let now = 1000;
+
+        // Pending quote (valid)
+        store.add_quote(QuoteRecord {
+            id: "q_valid".to_string(),
+            recipient: "rec1".to_string(),
+            amount_lamports: 100,
+            reference_pubkey: "ref1".to_string(),
+            created_at: now,
+            expires_at: now + 900,
+            status: QuoteStatus::Pending,
+            label: None,
+            message: None,
+        });
+
+        // Expired quote
+        store.add_quote(QuoteRecord {
+            id: "q_expired".to_string(),
+            recipient: "rec2".to_string(),
+            amount_lamports: 200,
+            reference_pubkey: "ref2".to_string(),
+            created_at: now - 1000,
+            expires_at: now - 100,
+            status: QuoteStatus::Pending,
+            label: None,
+            message: None,
+        });
+
+        let pruned = store.prune_expired(now);
+        assert_eq!(pruned, 1);
+
+        let summary = store.get_summary();
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.expired, 1);
+        assert_eq!(summary.settled, 0);
     }
 }
