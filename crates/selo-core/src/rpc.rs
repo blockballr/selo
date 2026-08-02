@@ -123,6 +123,7 @@ pub fn parse_token_accounts(body: &str) -> Result<Vec<TokenBalance>, String> {
     Ok(balances)
 }
 
+/// integration test
 #[cfg(test)]
 mod tests {
     use super::*;
