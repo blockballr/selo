@@ -32,6 +32,7 @@ pub mod tx;
 pub mod vtx;
 pub mod x402;
 // pub mod zk;
+pub mod solana_pay;
 pub mod store;
 
 pub use brain::*;

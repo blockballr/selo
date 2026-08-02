@@ -604,9 +604,11 @@ dependencies = [
 name = "selo-tool"
 version = "0.1.0"
 dependencies = [
+ "bs58",
  "selo-core",
  "serde",
  "serde_json",
+ "sha2",
  "ureq",
 ]
 

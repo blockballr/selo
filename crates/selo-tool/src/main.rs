@@ -1,9 +1,41 @@
 mod rpc;
-mod store_io;
 
 use rpc::ToolRpc;
-use selo_core::{brain, store::QuoteRecord, store::QuoteStatus, AccountingEngine, RpcSeam};
+use selo_core::solana_pay::{build_solana_pay_url, SolanaPayParams};
+use selo_core::store::{QuoteRecord, QuoteStatus, SeloStore};
+use selo_core::{brain, AccountingEngine, RpcSeam};
+use sha2::{Digest, Sha256};
 use std::env;
+use std::fs;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const STORE_PATH: &str = ".selo_store.json";
+/// loads local state store or initializes a new one.
+fn load_store() -> SeloStore {
+    if Path::new(STORE_PATH).exists() {
+        if let Ok(content) = fs::read_to_string(STORE_PATH) {
+            if let Ok(store) = serde_json::from_str(&content) {
+                return store;
+            }
+        }
+    }
+    SeloStore::new()
+}
+/// saves state store to disk.
+fn save_store(store: &SeloStore) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
+    fs::write(STORE_PATH, content).map_err(|e| e.to_string())
+}
+/// deterministically derives or generates a single-use reference key string.
+fn generate_reference_key(now_unix: u64, amount: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(now_unix.to_le_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(b"selo_reference_seed");
+    let result = hasher.finalize();
+    bs58::encode(result).into_string()
+}
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
@@ -12,10 +44,14 @@ fn main() -> Result<(), String> {
         println!("Selo Accounting Engine CLI");
         println!("Usage: selo-tool <command> [args]");
         println!("\nCommands:");
-        println!("  issue <sku> [qty]       Issue a quote intent and save to local store");
-        println!("  check [quote_id]        Check payment/reconciliation status of quotes");
-        println!("  balance <pubkey>        Query account balance from Solana network");
-        println!("  blockhash               Fetch latest blockhash");
+        println!("  balance <pubkey>                                 Query account balance");
+        println!(
+            "  quote <sku> [qty]                                Generate legacy catalog quote"
+        );
+        println!("  issue --amount <lamports> --recipient <pubkey>   Issue a Solana Pay quote with reference key");
+        println!("  check                                            Inspect pending local quotes");
+        println!("  confirm                                          Reconcile pending quotes with on-chain transactions");
+        println!("  blockhash                                        Fetch latest blockhash");
         return Ok(());
     }
 
@@ -26,89 +62,203 @@ fn main() -> Result<(), String> {
     let engine = AccountingEngine::new(rpc);
 
     match args[1].as_str() {
-        "issue" => {
-            let sku = args
-                .get(2)
-                .cloned()
-                .unwrap_or_else(|| "SKU-SOL-100".to_string());
-            let quantity: u32 = args.get(3).and_then(|q| q.parse().ok()).unwrap_or(1);
-
-            let now_unix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_secs() as i64;
-
-            let quote_args = brain::QuoteArgs {
-                sku: sku.clone(),
-                quantity,
-                now_unix,
-            };
-
-            // Call core brain engine
-            let _quote_response = brain::action_quote(&engine.rpc, &quote_args)?;
-
-            // Generate deterministic record entry
-            let quote_id = format!("Q-{}", now_unix % 100000);
-            let dummy_ref_pubkey = format!("RefPDA{}", now_unix % 1000);
-            let record = QuoteRecord {
-                id: quote_id.clone(),
-                sku,
-                quantity,
-                amount_lamports: (quantity as u64) * 100_000_000, // standard lamport amount
-                reference_pubkey: dummy_ref_pubkey,
-                created_at: now_unix,
-                status: QuoteStatus::Pending,
-            };
-
-            // Persist to local store
-            let mut store = store_io::load_store();
-            store.add_quote(record);
-            store_io::save_store(&store)?;
-
-            println!("✅ Quote Issued and Saved to Store!");
-            println!("   ID: {}", quote_id);
-            println!("   Status: Pending");
-        }
-
-        "check" => {
-            let store = store_io::load_store();
-            let target_id = args.get(2);
-
-            match target_id {
-                Some(id) => match store.find_quote(id) {
-                    Some(q) => {
-                        println!("Quote Details for [{}]", q.id);
-                        println!("  SKU: {}", q.sku);
-                        println!("  Quantity: {}", q.quantity);
-                        println!("  Lamports: {}", q.amount_lamports);
-                        println!("  Status: {:?}", q.status);
-                    }
-                    None => println!("❌ Quote ID [{}] not found in local store.", id),
-                },
-                None => {
-                    println!("Stored Quotes (Total: {}):", store.list_quotes().len());
-                    for q in store.list_quotes() {
-                        println!(
-                            "  - [{}] SKU: {} | Qty: {} | Status: {:?}",
-                            q.id, q.sku, q.quantity, q.status
-                        );
-                    }
-                }
-            }
-        }
-
         "balance" => {
             let address = args.get(2).ok_or("Missing public key address")?;
             let balance = engine.rpc.get_balance(address)?;
             println!("Balance for {}: {} lamports", address, balance);
         }
+        "quote" => {
+            let sku = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "SKU-SOL-100".to_string());
+            let quantity: u32 = args.get(3).and_then(|q| q.parse().ok()).unwrap_or(1);
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs() as i64;
 
+            let quote_args = brain::QuoteArgs {
+                sku,
+                quantity,
+                now_unix,
+            };
+
+            let response = brain::action_quote(&engine.rpc, &quote_args)?;
+            println!("{}", response);
+        }
+        "issue" => {
+            let mut amount: u64 = 500_000_000;
+            let mut recipient: String = String::new();
+            let mut label: Option<String> = None;
+            let mut message: Option<String> = None;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--amount" => {
+                        if let Some(val) = args.get(i + 1) {
+                            amount = val.parse().unwrap_or(amount);
+                        }
+                        i += 2;
+                    }
+                    "--recipient" => {
+                        if let Some(val) = args.get(i + 1) {
+                            recipient = val.clone();
+                        }
+                        i += 2;
+                    }
+                    "--label" => {
+                        if let Some(val) = args.get(i + 1) {
+                            label = Some(val.clone());
+                        }
+                        i += 2;
+                    }
+                    "--message" => {
+                        if let Some(val) = args.get(i + 1) {
+                            message = Some(val.clone());
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+
+            if recipient.is_empty() {
+                return Err("Missing required argument: --recipient <pubkey>".to_string());
+            }
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+
+            let expires_at = now + 900;
+            let ref_key = generate_reference_key(now, amount);
+            let quote_id = format!("q_{:.8}", ref_key);
+
+            let record = QuoteRecord {
+                id: quote_id.clone(),
+                recipient: recipient.clone(),
+                amount_lamports: amount,
+                reference_pubkey: ref_key.clone(),
+                created_at: now,
+                expires_at,
+                status: QuoteStatus::Pending,
+                label: label.clone(),
+                message: message.clone(),
+            };
+
+            let pay_params = SolanaPayParams {
+                recipient: &recipient,
+                amount_lamports: amount,
+                reference_pubkey: &ref_key,
+                label: label.as_deref(),
+                message: message.as_deref(),
+            };
+
+            let pay_url = build_solana_pay_url(&pay_params);
+
+            let mut store = load_store();
+            store.add_quote(record);
+            store.updated_at = now;
+            save_store(&store)?;
+
+            println!("✓ Quote Issued Successfully [{}]", quote_id);
+            println!("  Reference Key : {}", ref_key);
+            println!("  Solana Pay URI: {}", pay_url);
+        }
+        "check" => {
+            let store = load_store();
+            let pending = store.get_pending_quotes();
+            println!("Selo Accounting Store Status");
+            println!("Total Quotes Stored: {}", store.quotes.len());
+            println!("Pending Quotes     : {}", pending.len());
+            println!("{:-<60}", "");
+
+            for q in pending {
+                let sol_amount = q.amount_lamports as f64 / 1_000_000_000.0;
+                println!(
+                    "ID: {} | Amount: {} SOL | Ref: {:.12}... | Label: {}",
+                    q.id,
+                    sol_amount,
+                    q.reference_pubkey,
+                    q.label.as_deref().unwrap_or("N/A")
+                );
+            }
+        }
+        "confirm" => {
+            let mut store = load_store();
+            let pending_items: Vec<(String, String)> = store
+                .quotes
+                .iter()
+                .filter_map(|q| {
+                    if matches!(q.status, QuoteStatus::Pending) {
+                        Some((q.id.clone(), q.reference_pubkey.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if pending_items.is_empty() {
+                println!("No pending quotes to reconcile.");
+                return Ok(());
+            }
+
+            println!(
+                "Scanning on-chain signatures for {} pending quote(s)...",
+                pending_items.len()
+            );
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+
+            let mut settled_count = 0;
+
+            for (quote_id, ref_key) in pending_items {
+                match engine.rpc.get_signatures(&ref_key) {
+                    Ok(sigs) if !sigs.is_empty() => {
+                        let tx_sig = sigs[0].clone();
+                        if store.settle_quote(&quote_id, tx_sig.clone(), now) {
+                            println!("✓ Quote [{}] SETTLED via Tx: {}", quote_id, tx_sig);
+                            settled_count += 1;
+                        }
+                    }
+                    Ok(_) => {
+                        println!("  Quote [{}] - Pending (no transactions found)", quote_id);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  Quote [{}] - Warning fetching RPC signatures: {}",
+                            quote_id, e
+                        );
+                    }
+                }
+            }
+
+            if settled_count > 0 {
+                store.updated_at = now;
+                save_store(&store)?;
+                println!("------------------------------------------------------------");
+                println!(
+                    "Reconciliation complete. Settled {} quote(s).",
+                    settled_count
+                );
+            } else {
+                println!("------------------------------------------------------------");
+                println!("Reconciliation complete. No new settlements detected.");
+            }
+        }
         "blockhash" => {
             let hash = engine.rpc.get_latest_blockhash()?;
             println!("Latest blockhash: {}", hash);
         }
-
-        _ => println!("Unknown command: {}", args[1]),
+        _ => {
+            println!("Unknown command: {}", args[1]);
+        }
     }
 
     Ok(())

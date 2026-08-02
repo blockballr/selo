@@ -11,7 +11,6 @@ impl ToolRpc {
             rpc_url: rpc_url.to_string(),
         }
     }
-
     /// helper: perform JSON-RPC POST requests using ureq
     fn post(&self, payload: Value) -> Result<Value, String> {
         let response = ureq::post(&self.rpc_url)
@@ -19,10 +18,16 @@ impl ToolRpc {
             .send_json(payload)
             .map_err(|e| format!("HTTP transport error: {}", e))?;
 
-        response
+        let res: Value = response
             .into_body()
             .read_json()
-            .map_err(|e| format!("JSON parsing error: {}", e))
+            .map_err(|e| format!("JSON parsing error: {}", e))?;
+
+        if let Some(err) = res.get("error") {
+            return Err(format!("Solana RPC error: {}", err));
+        }
+
+        Ok(res)
     }
 }
 
