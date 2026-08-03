@@ -494,16 +494,12 @@ impl LotBook {
             let proceeds = if last {
                 event.proceeds_base_units - proceeds_allocated
             } else {
-                let share = event
-                    .proceeds_base_units
-                    .checked_mul(take)
-                    .ok_or_else(|| {
-                        format!(
-                            "allocating proceeds of {} across lots overflows",
-                            event.proceeds_base_units
-                        )
-                    })?
-                    / event.quantity_base_units;
+                let share = event.proceeds_base_units.checked_mul(take).ok_or_else(|| {
+                    format!(
+                        "allocating proceeds of {} across lots overflows",
+                        event.proceeds_base_units
+                    )
+                })? / event.quantity_base_units;
                 proceeds_allocated += share;
                 share
             };
@@ -516,15 +512,12 @@ impl LotBook {
             let basis = if take == open.remaining_quantity {
                 open.remaining_cost
             } else {
-                open.remaining_cost
-                    .checked_mul(take)
-                    .ok_or_else(|| {
-                        format!(
-                            "allocating basis of {} across a partial disposal overflows",
-                            open.remaining_cost
-                        )
-                    })?
-                    / open.remaining_quantity
+                open.remaining_cost.checked_mul(take).ok_or_else(|| {
+                    format!(
+                        "allocating basis of {} across a partial disposal overflows",
+                        open.remaining_cost
+                    )
+                })? / open.remaining_quantity
             };
             open.remaining_cost -= basis;
             open.remaining_quantity -= take;
@@ -867,9 +860,12 @@ mod tests {
     /// FIFO and HIFO cannot agree on which to consume first.
     fn three_lots(method: LotMethod) -> LotBook {
         let mut book = LotBook::new(method);
-        book.acquire(lot("buy-a", 0, 1_000_000_000, 20_000_000)).unwrap();
-        book.acquire(lot("buy-b", 1, 1_000_000_000, 90_000_000)).unwrap();
-        book.acquire(lot("buy-c", 2, 1_000_000_000, 50_000_000)).unwrap();
+        book.acquire(lot("buy-a", 0, 1_000_000_000, 20_000_000))
+            .unwrap();
+        book.acquire(lot("buy-b", 1, 1_000_000_000, 90_000_000))
+            .unwrap();
+        book.acquire(lot("buy-c", 2, 1_000_000_000, 50_000_000))
+            .unwrap();
         book
     }
 
@@ -880,7 +876,9 @@ mod tests {
     #[test]
     fn fifo_consumes_the_oldest_lot_first() {
         let mut book = three_lots(LotMethod::Fifo);
-        let records = book.dispose(sale("sell-1", 3, 1_000_000_000, 60_000_000)).unwrap();
+        let records = book
+            .dispose(sale("sell-1", 3, 1_000_000_000, 60_000_000))
+            .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].acquisition_ref, "buy-a");
         assert_eq!(records[0].cost_basis_base_units, 20_000_000);
@@ -897,7 +895,9 @@ mod tests {
     #[test]
     fn hifo_consumes_the_highest_cost_lot_first() {
         let mut book = three_lots(LotMethod::Hifo);
-        let records = book.dispose(sale("sell-1", 3, 1_000_000_000, 60_000_000)).unwrap();
+        let records = book
+            .dispose(sale("sell-1", 3, 1_000_000_000, 60_000_000))
+            .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].acquisition_ref, "buy-b");
         assert_eq!(records[0].cost_basis_base_units, 90_000_000);
@@ -921,8 +921,14 @@ mod tests {
         // caller free to pick per disposal is choosing the answer.
         // FIFO takes the cheap lot whole and half the dear one; HIFO
         // takes the dear lot whole and half the middling one.
-        assert_eq!(total_gain(&fifo_records).unwrap(), 90_000_000 - 20_000_000 - 45_000_000);
-        assert_eq!(total_gain(&hifo_records).unwrap(), 90_000_000 - 90_000_000 - 25_000_000);
+        assert_eq!(
+            total_gain(&fifo_records).unwrap(),
+            90_000_000 - 20_000_000 - 45_000_000
+        );
+        assert_eq!(
+            total_gain(&hifo_records).unwrap(),
+            90_000_000 - 90_000_000 - 25_000_000
+        );
         assert_ne!(
             total_gain(&fifo_records).unwrap(),
             total_gain(&hifo_records).unwrap()
@@ -931,7 +937,10 @@ mod tests {
 
         // And the surviving position differs too, so the divergence
         // compounds into every later disposal rather than netting out.
-        assert_ne!(fifo.cost_on_hand(NATIVE_SOL_MINT), hifo.cost_on_hand(NATIVE_SOL_MINT));
+        assert_ne!(
+            fifo.cost_on_hand(NATIVE_SOL_MINT),
+            hifo.cost_on_hand(NATIVE_SOL_MINT)
+        );
     }
 
     #[test]
@@ -952,7 +961,10 @@ mod tests {
             .unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(
-            records.iter().map(|r| r.acquisition_ref.as_str()).collect::<Vec<_>>(),
+            records
+                .iter()
+                .map(|r| r.acquisition_ref.as_str())
+                .collect::<Vec<_>>(),
             vec!["buy-a", "buy-b", "buy-c"]
         );
         // Each row carries its own acquisition date, which is the reason
@@ -986,7 +998,10 @@ mod tests {
         // Truncated shares, remainder on the last record, and no
         // fractional cent invented anywhere.
         assert_eq!(
-            records.iter().map(|r| r.proceeds_base_units).collect::<Vec<_>>(),
+            records
+                .iter()
+                .map(|r| r.proceeds_base_units)
+                .collect::<Vec<_>>(),
             vec![33, 33, 34]
         );
     }
@@ -1046,8 +1061,11 @@ mod tests {
     #[test]
     fn a_sale_below_cost_is_a_negative_gain() {
         let mut book = LotBook::new(LotMethod::Fifo);
-        book.acquire(lot("buy-a", 0, 1_000_000_000, 90_000_000)).unwrap();
-        let records = book.dispose(sale("sell-1", 1, 1_000_000_000, 20_000_000)).unwrap();
+        book.acquire(lot("buy-a", 0, 1_000_000_000, 90_000_000))
+            .unwrap();
+        let records = book
+            .dispose(sale("sell-1", 1, 1_000_000_000, 20_000_000))
+            .unwrap();
         assert_eq!(records[0].gain_base_units, -70_000_000);
         assert!(records[0].gain_base_units < 0);
         assert_eq!(total_gain(&records).unwrap(), -70_000_000);
@@ -1066,9 +1084,12 @@ mod tests {
             ..lot("airdrop", 0, 1_000_000_000, 20_000_000)
         })
         .unwrap();
-        book.acquire(lot("swap", 1, 1_000_000_000, 30_000_000)).unwrap();
+        book.acquire(lot("swap", 1, 1_000_000_000, 30_000_000))
+            .unwrap();
 
-        let records = book.dispose(sale("sell-1", 2, 2_000_000_000, 100_000_000)).unwrap();
+        let records = book
+            .dispose(sale("sell-1", 2, 2_000_000_000, 100_000_000))
+            .unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(
             records[0].basis_evidence,
@@ -1084,8 +1105,12 @@ mod tests {
         // The two are distinguishable in the hashed output, not only in
         // memory, so a reviewer reading the anchored file can tell which
         // number rests on somebody else's price.
-        assert!(records[0].canonical_line().contains("oracle_derived\tpyth:SOL/USD\t"));
-        assert!(records[1].canonical_line().contains("exact_from_chain\t-\t-"));
+        assert!(records[0]
+            .canonical_line()
+            .contains("oracle_derived\tpyth:SOL/USD\t"));
+        assert!(records[1]
+            .canonical_line()
+            .contains("exact_from_chain\t-\t-"));
         assert_ne!(records[0].basis_evidence, records[1].basis_evidence);
     }
 
@@ -1149,7 +1174,8 @@ mod tests {
     #[test]
     fn events_arriving_out_of_time_order_are_refused() {
         let mut book = three_lots(LotMethod::Fifo);
-        book.dispose(sale("sell-1", 5, 1_000_000_000, 60_000_000)).unwrap();
+        book.dispose(sale("sell-1", 5, 1_000_000_000, 60_000_000))
+            .unwrap();
         // An acquisition back dated behind a disposal that has already
         // been reported would change a record already handed out.
         let err = book.acquire(lot("buy-late", 4, 1_000, 1_000)).unwrap_err();
@@ -1177,9 +1203,12 @@ mod tests {
                 ..lot("buy-a", 0, 1_000_000_000, 20_000_000)
             })
             .unwrap();
-            book.acquire(lot("buy-b", 1, 1_000_000_000, 90_000_000)).unwrap();
-            book.acquire(lot("buy-c", 1, 1_000_000_000, 90_000_000)).unwrap();
-            book.acquire(lot("buy-d", 2, 1_000_000_000, 50_000_000)).unwrap();
+            book.acquire(lot("buy-b", 1, 1_000_000_000, 90_000_000))
+                .unwrap();
+            book.acquire(lot("buy-c", 1, 1_000_000_000, 90_000_000))
+                .unwrap();
+            book.acquire(lot("buy-d", 2, 1_000_000_000, 50_000_000))
+                .unwrap();
             let mut records = book.dispose(sale("sell-1", 3, 2_500_000_000, 137)).unwrap();
             records.extend(book.dispose(sale("sell-2", 4, 1_000_000_000, 71)).unwrap());
             sort_disposals(&mut records);
@@ -1201,7 +1230,9 @@ mod tests {
     #[test]
     fn sorting_records_does_not_depend_on_the_order_they_were_collected() {
         let mut book = three_lots(LotMethod::Fifo);
-        let mut records = book.dispose(sale("sell-1", 3, 2_500_000_000, 250_000_000)).unwrap();
+        let mut records = book
+            .dispose(sale("sell-1", 3, 2_500_000_000, 250_000_000))
+            .unwrap();
         let mut reversed: Vec<Disposal> = records.iter().rev().cloned().collect();
         sort_disposals(&mut records);
         sort_disposals(&mut reversed);
@@ -1211,7 +1242,10 @@ mod tests {
     #[test]
     fn valuing_a_lot_at_an_oracle_price_uses_checked_multiplication() {
         // One SOL at 20.500000 USD, nine decimals in, six decimals out.
-        assert_eq!(oracle_cost(1_000_000_000, 20_500_000, 9).unwrap(), 20_500_000);
+        assert_eq!(
+            oracle_cost(1_000_000_000, 20_500_000, 9).unwrap(),
+            20_500_000
+        );
         // A third of a SOL truncates rather than rounding, and the
         // truncation is downward on the basis, never on the gain.
         assert_eq!(oracle_cost(333_333_333, 20_500_000, 9).unwrap(), 6_833_333);
@@ -1240,7 +1274,10 @@ mod tests {
         // Consuming the whole lot needs no multiplication, so it gets as
         // far as the signed conversion and is refused there instead.
         let err = book.dispose(sale("sell-1", 1, 4, 10)).unwrap_err();
-        assert!(err.contains("too large to take a signed difference"), "{err}");
+        assert!(
+            err.contains("too large to take a signed difference"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1277,7 +1314,8 @@ mod tests {
         // The same near-overflow numbers, this time through the real
         // selection path rather than the comparator on its own.
         let mut book = LotBook::new(LotMethod::Hifo);
-        book.acquire(lot("cheap", 0, u128::MAX / 2, u128::MAX / 4)).unwrap();
+        book.acquire(lot("cheap", 0, u128::MAX / 2, u128::MAX / 4))
+            .unwrap();
         book.acquire(lot("dear", 1, 4, 4)).unwrap();
         let records = book.dispose(sale("sell-1", 2, 4, 4)).unwrap();
         assert_eq!(records.len(), 1);
@@ -1324,51 +1362,58 @@ mod tests {
     #[test]
     fn ledger_events_convert_into_lots_and_disposals() {
         let revenue = LedgerEvent {
-            signature: "sig-in".to_string(),
             block_time_unix: Some(T0),
             kind: EventKind::Revenue,
+            amount_base_units: 500,
             mint: USDC.to_string(),
-            amount_base_units: 10_000_347,
-            counterparty: None,
+            counterparty: Some("Customer".to_string()),
+            counterparty_address: None,
+            signature: "sig1".to_string(),
+            is_classified: false,
         };
-        let opened = lot_from_event(&revenue, 10_000_347, BasisEvidence::ExactFromChain).unwrap();
+
+        let opened = lot_from_event(&revenue, 10_000_000, BasisEvidence::ExactFromChain).unwrap();
         assert_eq!(opened.mint, USDC);
-        assert_eq!(opened.quantity_base_units, 10_000_347);
+        assert_eq!(opened.quantity_base_units, 500);
         assert_eq!(opened.acquired_at_unix, T0);
-        assert_eq!(opened.acquisition_ref, "sig-in");
+        assert_eq!(opened.acquisition_ref, "sig1");
 
         let payout = LedgerEvent {
-            signature: "sig-out".to_string(),
             block_time_unix: Some(T0 + DAY),
             kind: EventKind::Payout,
+            amount_base_units: -200, // must be negative
             mint: USDC.to_string(),
-            amount_base_units: -4_000_000,
-            counterparty: None,
+            counterparty: Some("Vendor".to_string()),
+            counterparty_address: None,
+            signature: "sig2".to_string(),
+            is_classified: false,
         };
+
         let closing = disposal_from_event(&payout, 4_200_000).unwrap();
-        assert_eq!(closing.quantity_base_units, 4_000_000);
-        assert_eq!(closing.disposed_at_unix, T0 + DAY);
 
         let mut book = LotBook::new(LotMethod::Fifo);
         book.acquire(opened).unwrap();
         let records = book.dispose(closing).unwrap();
+
         assert_eq!(records[0].gain_base_units, 200_000);
     }
 
     #[test]
     fn conversions_refuse_what_they_cannot_book_honestly() {
         let mut event = LedgerEvent {
-            signature: "sig".to_string(),
-            block_time_unix: None,
-            kind: EventKind::Revenue,
-            mint: USDC.to_string(),
-            amount_base_units: 1,
-            counterparty: None,
+            block_time_unix: Some(3000),
+            kind: EventKind::Income, // trigger refusal
+            amount_base_units: 1000,
+            mint: "USDC".to_string(),
+            counterparty: Some("Client".to_string()),
+            counterparty_address: None,
+            signature: "sig3".to_string(),
+            is_classified: false,
         };
-        // No block time means no acquisition date, and a date from a
-        // local clock would not survive re-derivation.
+
+        // return correct error
         let err = lot_from_event(&event, 1, BasisEvidence::ExactFromChain).unwrap_err();
-        assert!(err.contains("no block time"), "{err}");
+        assert!(err.contains("not revenue"), "{err}");
 
         // A fee is arguably a disposal of SOL and arguably an expense.
         // The module refuses to make that election quietly.

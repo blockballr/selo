@@ -58,6 +58,7 @@ fn generate_reference_key(now_unix: u64, amount: u64) -> String {
 }
 
 fn main() -> Result<(), String> {
+    dotenvy::dotenv().ok();
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -74,12 +75,16 @@ fn main() -> Result<(), String> {
         println!("  expire                                           Sweep expired pending quotes in store");
         println!("  rules [--add <pubkey> --name <label>]            Manage counterparty entity mapping rules");
         println!("  backfill <pubkey>                                Paginate and list historical transactions");
+        println!("  ingest <pubkey>                                  Parse transactions, calculate balance deltas & classify ledger events");
         println!("  blockhash                                        Fetch latest blockhash");
         return Ok(());
     }
 
-    let rpc_url = env::var("SOLANA_RPC_URL")
-        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    let rpc_url = match env::var("HELIUS_API_KEY") {
+        Ok(key) => format!("https://mainnet.helius-rpc.com/?api-key={}", key),
+        Err(_) => env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
+    };
 
     let rpc = ToolRpc::new(&rpc_url);
     let engine = AccountingEngine::new(rpc);
@@ -370,6 +375,85 @@ fn main() -> Result<(), String> {
             println!("Found {} signature(s):", signatures.len());
             for (idx, sig) in signatures.iter().enumerate() {
                 println!("  {:02}. {}", idx + 1, sig);
+            }
+        }
+        "ingest" => {
+            let address = args
+                .get(2)
+                .ok_or("Missing public key address for ingestion")?;
+            let rules = load_rules();
+            let entity_label = rules.get_name(address);
+
+            println!(
+                "Ingesting & categorizing transaction history for: {} [{}]",
+                address, entity_label
+            );
+            println!("{:-<75}", "");
+
+            let backfiller = selo_core::ledger::Backfiller::new(&engine.rpc);
+            let signatures = backfiller.backfill(address)?;
+
+            let mut total_events = 0;
+            let mut classified_count = 0;
+            let mut unclassified_count = 0;
+
+            for (idx, sig) in signatures.iter().enumerate() {
+                // added delay due to rate limiter from intial testing
+                // std::thread::sleep(std::time::Duration::from_millis(200));
+                match engine.rpc.get_transaction(sig) {
+                    Ok(tx_data) => {
+                        let events = selo_core::ledger::parse_transaction_events(
+                            sig, &tx_data, address, &rules,
+                        );
+                        for event in events {
+                            total_events += 1;
+                            if event.is_classified {
+                                classified_count += 1;
+                            } else {
+                                unclassified_count += 1;
+                            }
+
+                            let amount_sol = event.amount_base_units as f64 / 1_000_000_000.0;
+                            let cp = event
+                                .counterparty
+                                .as_deref()
+                                .unwrap_or("Unknown Counterparty");
+                            let status_flag = if event.is_classified {
+                                "✓ [Auto-Labeled]"
+                            } else {
+                                "! [Needs Review]"
+                            };
+
+                            println!(
+                                "  {:02}. {:<12} | {:>10.6} SOL | CP: {:<28} | {}",
+                                idx + 1,
+                                event.kind.as_str(),
+                                amount_sol,
+                                cp,
+                                status_flag
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "  {:02}. Sig: {} | Error fetching detail: {}",
+                            idx + 1,
+                            sig,
+                            e
+                        );
+                    }
+                }
+            }
+
+            println!("{:-<75}", "");
+            println!(
+                "Ingestion Summary -> Total Events: {} | Auto-Labeled: {} | Needs Review: {}",
+                total_events, classified_count, unclassified_count
+            );
+            if unclassified_count > 0 {
+                println!(
+                    "Hint: Use 'selo-tool rules --add <pubkey> --name <label>' to classify remaining unknown counterparties."
+                );
             }
         }
         "blockhash" => {
