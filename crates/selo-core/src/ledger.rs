@@ -164,11 +164,17 @@ impl CounterpartyRegistry {
     }
 
     /// Retrieves the label for an address, or returns a fallback default.
-    pub fn get_name(&self, address: &str) -> String {
+    pub fn get_name(&self, pubkey: &str) -> String {
         self.rules
-            .get(address)
+            .get(pubkey)
             .cloned()
             .unwrap_or_else(|| "Unknown Counterparty".to_string())
+    }
+
+    /// address slicing
+    pub fn format_address(&self, pubkey: &str) -> String {
+        let len = std::cmp::min(pubkey.len(), 8);
+        format!("{}...", &pubkey[..len])
     }
 
     pub fn get_name_or_address(&self, pubkey: &str) -> String {
@@ -520,5 +526,24 @@ mod tests {
 
         assert_eq!(events[1].kind, EventKind::FeePaid);
         assert_eq!(events[1].amount_base_units, 5000);
+    }
+
+    #[test]
+    fn test_registry_separation() {
+        let mut registry = CounterpartyRegistry::new();
+        let known = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+        // fake address: not pre-seeded
+        let fake_unknown = "88888888888888888888888888888888888888888888";
+
+        registry
+            .rules
+            .insert(known.to_string(), "Jupiter".to_string());
+
+        assert_eq!(registry.get_name(known), "Jupiter");
+
+        // "needs review" trigger
+        assert_eq!(registry.get_name(fake_unknown), "Unknown Counterparty");
+
+        assert_eq!(registry.format_address(fake_unknown), "88888888...");
     }
 }

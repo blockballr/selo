@@ -223,17 +223,22 @@ fn main() -> Result<(), String> {
             if expired_count > 0 {
                 println!("! Auto-expired {} quote(s) during check.", expired_count);
             }
-            println!("{:-<60}", "");
+            println!("{:-<75}", "");
+            println!(
+                "{:<12} | {:<12} | {:<20} | {:<8} | {}",
+                "ID", "Amount", "Reference", "TTL", "Label"
+            );
+            println!("{:-<75}", "");
 
             for q in pending {
                 let sol_amount = q.amount_lamports as f64 / 1_000_000_000.0;
                 let remaining_secs = q.expires_at.saturating_sub(now);
                 println!(
-                    "ID: {} | Amount: {} SOL | Ref: {:.12}... | TTL: {}s | Label: {}",
+                    "{:<12} | {:>10.6} SOL | {:<20} | {:<8} | {}",
                     q.id,
                     sol_amount,
-                    q.reference_pubkey,
-                    remaining_secs,
+                    format!("{:.12}...", q.reference_pubkey),
+                    format!("{}s", remaining_secs),
                     q.label.as_deref().unwrap_or("N/A")
                 );
             }
@@ -375,8 +380,11 @@ fn main() -> Result<(), String> {
             let signatures = backfiller.backfill(address)?;
 
             println!("Found {} signature(s):", signatures.len());
+            println!("{:-<75}", "");
+            println!("{:<5} | {}", "No.", "Signature");
+            println!("{:-<75}", "");
             for (idx, sig) in signatures.iter().enumerate() {
-                println!("  {:02}. {}", idx + 1, sig);
+                println!("{:<5} | {}", idx + 1, sig);
             }
         }
         "ingest" => {
@@ -395,73 +403,75 @@ fn main() -> Result<(), String> {
             let backfiller = selo_core::ledger::Backfiller::new(&engine.rpc);
             let signatures = backfiller.backfill(address)?;
 
+            let mut auto_labeled_count = 0;
+            let mut needs_review_count = 0;
             let mut total_events = 0;
-            let mut classified_count = 0;
-            let mut unclassified_count = 0;
+            let mut row_counter = 1;
 
             for (idx, sig) in signatures.iter().enumerate() {
-                // added delay due to rate limiter from intial testing
-                // std::thread::sleep(std::time::Duration::from_millis(200));
                 match engine.rpc.get_transaction(sig) {
                     Ok(tx_data) => {
-                        // SOL events
                         let mut all_events = selo_core::ledger::parse_transaction_events(
                             sig, &tx_data, address, &rules,
                         );
 
-                        // 2. token events (USDG and USDC mints)
                         let usdg_mint = "2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH";
                         let usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-                        let token_events_usdg = selo_core::ledger::parse_spl_token_events(
+                        all_events.extend(selo_core::ledger::parse_spl_token_events(
                             sig, &tx_data, address, usdg_mint, &rules,
-                        );
-                        let token_events_usdc = selo_core::ledger::parse_spl_token_events(
+                        ));
+                        all_events.extend(selo_core::ledger::parse_spl_token_events(
                             sig, &tx_data, address, usdc_mint, &rules,
-                        );
+                        ));
 
-                        all_events.extend(token_events_usdg);
-                        all_events.extend(token_events_usdc);
-
-                        // print combined events
                         for event in all_events {
                             total_events += 1;
-                            if event.is_classified {
-                                classified_count += 1;
+
+                            // Identify counterparty
+                            let addr = event.counterparty_address.as_deref().unwrap_or("Unknown");
+                            let cp_name = rules.get_name(addr);
+                            let is_classified = cp_name != "Unknown Counterparty";
+
+                            // mutually exclusive
+                            if is_classified {
+                                auto_labeled_count += 1;
                             } else {
-                                unclassified_count += 1;
+                                needs_review_count += 1;
                             }
 
-                            // address awareness
-                            let addr = event.counterparty_address.as_deref().unwrap_or("Unknown");
-                            let label = rules.get_name_or_address(addr);
+                            // UI: slice addr
+                            let label = if is_classified {
+                                cp_name
+                            } else {
+                                rules.format_address(addr)
+                            };
 
-                            let amount_display = event.amount_base_units as f64 / 1_000_000_000.0;
+                            let amount_display: f64 =
+                                event.amount_base_units as f64 / 1_000_000_000.0;
                             println!(
-                                "  {:02}. {:<12} | {:>10.6} | CP: {:<20} | Mint: {}...",
-                                idx + 1,
+                                "  {:02}. {:<12} | {:>10.6} | CP: {:<26} | Mint: {}...",
+                                row_counter,
                                 event.kind.as_str(),
                                 amount_display,
                                 label,
                                 &event.mint[..8]
                             );
+                            row_counter += 1
                         }
                     }
-                    Err(e) => {
-                        println!("  {:02}. Sig: {} | Error: {}", idx + 1, sig, e);
-                    }
+                    Err(e) => println!("  {:02}. Sig: {} | Error: {}", idx + 1, sig, e),
                 }
             }
 
             println!("{:-<75}", "");
             println!(
                 "Ingestion Summary -> Total Events: {} | Auto-Labeled: {} | Needs Review: {}",
-                total_events, classified_count, unclassified_count
+                total_events, auto_labeled_count, needs_review_count
             );
-            if unclassified_count > 0 {
-                println!(
-                    "Hint: Use 'selo-tool rules --add <pubkey> --name <label>' to classify remaining unknown counterparties."
-                );
+
+            if needs_review_count > 0 {
+                println!("Hint: Use 'selo-tool rules --add <pubkey> --name <label>' to classify remaining unknown counterparties.");
             }
         }
         "blockhash" => {
