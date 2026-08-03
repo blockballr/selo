@@ -86,6 +86,8 @@ fn main() -> Result<(), String> {
             .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
     };
 
+    println!("DEBUG: Attempting to connect to: {}", rpc_url);
+
     let rpc = ToolRpc::new(&rpc_url);
     let engine = AccountingEngine::new(rpc);
 
@@ -402,10 +404,27 @@ fn main() -> Result<(), String> {
                 // std::thread::sleep(std::time::Duration::from_millis(200));
                 match engine.rpc.get_transaction(sig) {
                     Ok(tx_data) => {
-                        let events = selo_core::ledger::parse_transaction_events(
+                        // SOL events
+                        let mut all_events = selo_core::ledger::parse_transaction_events(
                             sig, &tx_data, address, &rules,
                         );
-                        for event in events {
+
+                        // 2. token events (USDG and USDC mints)
+                        let usdg_mint = "2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH";
+                        let usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+                        let token_events_usdg = selo_core::ledger::parse_spl_token_events(
+                            sig, &tx_data, address, usdg_mint, &rules,
+                        );
+                        let token_events_usdc = selo_core::ledger::parse_spl_token_events(
+                            sig, &tx_data, address, usdc_mint, &rules,
+                        );
+
+                        all_events.extend(token_events_usdg);
+                        all_events.extend(token_events_usdc);
+
+                        // print combined events
+                        for event in all_events {
                             total_events += 1;
                             if event.is_classified {
                                 classified_count += 1;
@@ -413,34 +432,23 @@ fn main() -> Result<(), String> {
                                 unclassified_count += 1;
                             }
 
-                            let amount_sol = event.amount_base_units as f64 / 1_000_000_000.0;
-                            let cp = event
-                                .counterparty
-                                .as_deref()
-                                .unwrap_or("Unknown Counterparty");
-                            let status_flag = if event.is_classified {
-                                "✓ [Auto-Labeled]"
-                            } else {
-                                "! [Needs Review]"
-                            };
+                            // address awareness
+                            let addr = event.counterparty_address.as_deref().unwrap_or("Unknown");
+                            let label = rules.get_name_or_address(addr);
 
+                            let amount_display = event.amount_base_units as f64 / 1_000_000_000.0;
                             println!(
-                                "  {:02}. {:<12} | {:>10.6} SOL | CP: {:<28} | {}",
+                                "  {:02}. {:<12} | {:>10.6} | CP: {:<20} | Mint: {}...",
                                 idx + 1,
                                 event.kind.as_str(),
-                                amount_sol,
-                                cp,
-                                status_flag
+                                amount_display,
+                                label,
+                                &event.mint[..8]
                             );
                         }
                     }
                     Err(e) => {
-                        println!(
-                            "  {:02}. Sig: {} | Error fetching detail: {}",
-                            idx + 1,
-                            sig,
-                            e
-                        );
+                        println!("  {:02}. Sig: {} | Error: {}", idx + 1, sig, e);
                     }
                 }
             }

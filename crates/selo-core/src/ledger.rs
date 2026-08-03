@@ -155,7 +155,6 @@ impl CounterpartyRegistry {
             "2ojv9BAiA3hP8B82AGP8R2P8R8P8R8P8R8P8R8P8R8P8".to_string(),
             "Binance Hot Wallet".to_string(),
         );
-
         Self { rules }
     }
 
@@ -170,6 +169,14 @@ impl CounterpartyRegistry {
             .get(address)
             .cloned()
             .unwrap_or_else(|| "Unknown Counterparty".to_string())
+    }
+
+    pub fn get_name_or_address(&self, pubkey: &str) -> String {
+        self.rules.get(pubkey).cloned().unwrap_or_else(|| {
+            // DEBUG: calc safe slice length (min of address length or 8)
+            let len = std::cmp::min(pubkey.len(), 8);
+            format!("{}...", &pubkey[..len])
+        })
     }
 
     /// Returns the total number of registered counterparty rules.
@@ -281,8 +288,12 @@ pub fn parse_transaction_events(
     // second pass: If none, fall back to generic
     if !is_classified {
         for key in &account_keys {
+            if key == "11111111111111111111111111111111" {
+                continue;
+            }
+
             if key != target_wallet {
-                let label = registry.get_name(key);
+                let label = registry.get_name_or_address(key);
                 if label != "Unknown Counterparty" {
                     primary_counterparty_address = Some(key.clone());
                     primary_counterparty_label = Some(label);
@@ -325,7 +336,7 @@ pub fn parse_transaction_events(
 
             let net_delta = delta + fee;
 
-            if net_delta != 0 {
+            if net_delta.abs() > 1000 {
                 let kind = if net_delta > 0 {
                     if is_classified {
                         EventKind::Income
@@ -367,6 +378,79 @@ pub fn parse_transaction_events(
         }
     }
 
+    events
+}
+
+pub fn parse_spl_token_events(
+    signature: &str,
+    tx_data: &Value,
+    target_wallet: &str,
+    target_mint: &str,
+    registry: &CounterpartyRegistry,
+) -> Vec<LedgerEvent> {
+    let mut events = Vec::new();
+    let meta = match tx_data.get("meta") {
+        Some(m) => m,
+        None => return events,
+    };
+
+    //DEBUG: USDG mint address
+    // if let Some(post) = meta.get("postTokenBalances").and_then(|v| v.as_array()) {
+    //     for balance in post {
+    //         if let Some(mint) = balance.get("mint").and_then(|v| v.as_str()) {
+    //             if mint != "So11111111111111111111111111111111111111112" {
+    //                 println!("DEBUG: Found Mint in tx {}: {}", &signature[..8], mint);
+    //             }
+    //         }
+    //     }
+    // }
+
+    let empty_vec: Vec<Value> = Vec::new();
+
+    if let (Some(pre), Some(post)) = (meta.get("preTokenBalances"), meta.get("postTokenBalances")) {
+        // use &empty_vec instead of &vec![]
+        let pre_arr = pre.as_array().unwrap_or(&empty_vec);
+        let post_arr = post.as_array().unwrap_or(&empty_vec);
+
+        let get_balance = |arr: &Vec<Value>| -> u128 {
+            arr.iter()
+                .find(|b| {
+                    b.get("owner").and_then(|v| v.as_str()) == Some(target_wallet)
+                        && b.get("mint").and_then(|v| v.as_str()) == Some(target_mint)
+                })
+                .and_then(|b| b.get("uiTokenAmount").and_then(|a| a.get("amount")))
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0)
+        };
+
+        let pre_bal = get_balance(pre_arr);
+        let post_bal = get_balance(post_arr);
+        let delta = post_bal as i128 - pre_bal as i128;
+
+        // println!(
+        //     "DEBUG: Checking Mint {} for Wallet {}",
+        //     target_mint, target_wallet
+        // );
+        // println!("DEBUG: Pre-bal: {}, Post-bal: {}", pre_bal, post_bal);
+
+        if delta != 0 {
+            events.push(LedgerEvent {
+                block_time_unix: tx_data.get("blockTime").and_then(|v| v.as_i64()),
+                kind: if delta > 0 {
+                    EventKind::Income
+                } else {
+                    EventKind::Expense
+                },
+                amount_base_units: delta.abs(),
+                mint: target_mint.to_string(),
+                counterparty: Some(registry.get_name_or_address("Unknown")), // Fallback handled by logic
+                counterparty_address: Some(target_wallet.to_string()),
+                signature: signature.to_string(),
+                is_classified: true,
+            });
+        }
+    }
     events
 }
 

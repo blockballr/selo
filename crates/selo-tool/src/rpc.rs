@@ -90,7 +90,7 @@ impl RpcSeam for ToolRpc {
             "params": [
                 sig,
                 {
-                    "encoding": "json",
+                    "encoding": "jsonParsed",
                     "maxSupportedTransactionVersion": 0
                 }
             ]
