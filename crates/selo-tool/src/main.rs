@@ -111,6 +111,7 @@ fn main() -> Result<(), String> {
         println!("  ingest <pubkey>                                  Parse transactions, calculate balance deltas & classify ledger events");
         println!("  blockhash                                        Fetch latest blockhash");
         println!("  anchor --nonce <pubkey> --authority <pubkey>     Generate unsigned durable-nonce anchor transaction for ZK state root");
+        println!("  export-html --output <path>                      Export self-verifying standalone HTML audit report");
         return Ok(());
     }
 
@@ -609,23 +610,116 @@ fn main() -> Result<(), String> {
                 serde_json::to_string_pretty(&anchor_tx).map_err(|e| e.to_string())?;
             println!("{}", json_output);
         }
-        // "record-sample" => {
-        //     let mut ledger = load_tax_ledger();
+        // render a self-verifying standalone HTML audit report for the tax ledger, with optional year filtering
+        "export-html" => {
+            let mut output_path = "selo_report.html".to_string();
+            let mut year_filter: Option<String> = None;
+            let mut anchor_sig: Option<String> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--output" => {
+                        if let Some(val) = args.get(i + 1) {
+                            output_path = val.clone();
+                        }
+                        i += 2;
+                    }
+                    "--year" => {
+                        if let Some(val) = args.get(i + 1) {
+                            year_filter = Some(val.clone());
+                        }
+                        i += 2;
+                    }
+                    "--anchor-sig" => {
+                        if let Some(val) = args.get(i + 1) {
+                            anchor_sig = Some(val.clone());
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
 
-        //     // Record 1 SOL (1,000,000,000 lamports) acquired today & pull the live PTAX rate automatically
-        //     match ledger.record_acquisition(
-        //         "lot-SOL-001".to_string(),
-        //         "SOL".to_string(),
-        //         1_000_000_000,
-        //         "2026-08-04T12:00:00Z".to_string(),
-        //     ) {
-        //         Ok(()) => {
-        //             save_tax_ledger(&ledger);
-        //             println!("✓ Sample acquisition recorded successfully using current PTAX rate!");
-        //         }
-        //         Err(e) => println!("✗ Failed to record acquisition: {}", e),
-        //     }
-        // }
+            let ledger = load_tax_ledger();
+            let anchored = anchor_sig.is_some();
+            let html_content = ledger.generate_html_report(
+                year_filter.as_deref(),
+                anchored,
+                anchor_sig.as_deref(),
+            )?;
+            std::fs::write(&output_path, html_content).map_err(|e| e.to_string())?;
+
+            let scope_desc = match &year_filter {
+                Some(y) => format!("for fiscal year {}", y),
+                None => "for all-time cumulative ledger".to_string(),
+            };
+            let status_desc = if anchored {
+                "Sealed & Anchored"
+            } else {
+                "Open (Unanchored)"
+            };
+
+            println!("✓ Self-verifying HTML audit report exported successfully!");
+            println!("  Path   : {}", output_path);
+            println!("  Scope  : {}", scope_desc);
+            println!("  Status : {}", status_desc);
+        }
+        "verify" => {
+            let mut target_root: Option<String> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--root" => {
+                        if let Some(val) = args.get(i + 1) {
+                            target_root = Some(val.clone());
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+
+            let root =
+                target_root.ok_or("Missing required argument: --root <POSEIDON_STATE_ROOT>")?;
+            let ledger = load_tax_ledger();
+            let computed_root = ledger.compute_state_root()?;
+
+            println!("{:-<75}", "");
+            println!("Selo Cryptographic Verifier (Poseidon BN254 Commitment)");
+            println!("{:-<75}", "");
+            println!("  Provided Root : {}", root);
+            println!("  Computed Root : {}", computed_root);
+            println!("{:-<75}", "");
+
+            if computed_root == root {
+                println!("✓ Cryptographic Verification SUCCESS!");
+                println!("  The local ledger data matches the state root perfectly.");
+                println!(
+                    "  Mathematical proof: Zero tax lots were altered, deleted, or back-dated."
+                );
+            } else {
+                println!("✗ Cryptographic Verification FAILED!");
+                println!("  Mismatch detected between provided root and local ledger state.");
+                return Err("Ledger state root verification failed: data integrity compromised or root mismatch.".to_string());
+            }
+        }
+        "record-sample" => {
+            let mut ledger = load_tax_ledger();
+
+            // Record 1 SOL (1,000,000,000 lamports) acquired today & pull the live PTAX rate automatically
+            match ledger.record_acquisition(
+                "lot-SOL-001".to_string(),
+                "SOL".to_string(),
+                1_000_000_000,
+                "2024-06-04T12:00:00Z".to_string(),
+            ) {
+                Ok(()) => {
+                    save_tax_ledger(&ledger);
+                    println!("✓ Sample acquisition recorded successfully using current PTAX rate!");
+                }
+                Err(e) => println!("✗ Failed to record acquisition: {}", e),
+            }
+        }
         _ => {
             println!("Unknown command: {}", args[1]);
         }

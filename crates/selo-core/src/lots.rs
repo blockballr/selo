@@ -2,6 +2,9 @@
 //!
 //! tracks cost basis and acquisition history for token streams using FIFO/LIFO matching
 
+use ark_bn254::Fr;
+use ark_ff::{BigInteger, PrimeField};
+use light_poseidon::{Poseidon, PoseidonHasher};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,11 +109,57 @@ impl TaxLedger {
         Ok(total_cost_basis_brl)
     }
 
-    pub fn generate_report(&self) -> String {
+    /// compute: ZK-friendly Poseidon state root over the BN254 scalar field
+    pub fn compute_state_root(&self) -> Result<String, String> {
+        if self.lots.is_empty() {
+            return Ok("0x0".to_string());
+        }
+
+        let lots_clone = self.lots.clone();
+
+        // spawn thread 8mb allocation stack: safely handle heavy ZK matrix allocations on Windows
+        let handle = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let mut poseidon = Poseidon::<Fr>::new_circom(3)
+                    .map_err(|e| format!("Failed to initialize Poseidon hasher: {}", e))?;
+
+                let mut current_hash = Fr::from(0u64);
+
+                for lot in &lots_clone {
+                    let amount_fe = Fr::from(lot.amount);
+                    let ptax_scaled = (lot.ptax_rate_used * 10_000.0) as u64;
+                    let ptax_fe = Fr::from(ptax_scaled);
+
+                    current_hash = poseidon
+                        .hash(&[current_hash, amount_fe, ptax_fe])
+                        .map_err(|e| format!("Poseidon hashing failed: {}", e))?;
+                }
+
+                let repr = current_hash.into_bigint();
+                let bytes = repr.to_bytes_be();
+                Ok(format!("0x{}", hex::encode(bytes)))
+            })
+            .map_err(|e| format!("Failed to spawn hashing thread: {}", e))?;
+
+        handle
+            .join()
+            .map_err(|_| "State root computation thread panicked".to_string())?
+    }
+
+    // text summary with ZK Poseidon state root
+    pub fn generate_report(&self) -> Result<String, String> {
+        let state_root = self.compute_state_root()?;
+
         let mut report = String::new();
         report.push_str("==================================================\n");
         report.push_str("            SELO TAX LOT ACCOUNTING REPORT         \n");
         report.push_str("==================================================\n");
+        report.push_str(&format!(
+            "ZK State Root (Poseidon BN254):\n{}\n",
+            state_root
+        ));
+        report.push_str("--------------------------------------------------\n");
 
         if self.lots.is_empty() {
             report.push_str("No tax lots recorded in the ledger.\n");
@@ -127,6 +176,43 @@ impl TaxLedger {
                 ));
             }
         }
-        report
+        Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_poseidon_state_root_determinism() {
+        let ledger1 = TaxLedger { lots: vec![] };
+        assert_eq!(ledger1.compute_state_root().unwrap(), "0x0");
+
+        let sample_lot = TaxLot {
+            id: "lot-SOL-001".to_string(),
+            asset_symbol: "SOL".to_string(),
+            amount: 100_000_000,
+            unit_cost_basis_brl: 5.07,
+            ptax_rate_used: 5.0717,
+            acquired_at_utc: "2026-08-04T12:00:00Z".to_string(),
+        };
+
+        let ledger_a = TaxLedger {
+            lots: vec![sample_lot.clone()],
+        };
+        let root_a = ledger_a.compute_state_root().unwrap();
+        assert_ne!(root_a, "0x0");
+
+        let ledger_b = TaxLedger {
+            lots: vec![sample_lot],
+        };
+        let root_b = ledger_b.compute_state_root().unwrap();
+
+        // Verify that identical ledgers produce identical Poseidon commitments
+        assert_eq!(
+            root_a, root_b,
+            "Identical tax lot sets must yield matching Poseidon BN254 roots"
+        );
     }
 }

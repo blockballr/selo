@@ -1,4 +1,6 @@
 /target
+*.html
+!index.html
 .env
 .selo_store.json
 .selo_rules.json

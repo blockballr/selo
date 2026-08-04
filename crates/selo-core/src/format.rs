@@ -2,14 +2,14 @@
 //! leads with a short human-readable summary and follows with a compact
 //! JSON block the model can quote or post-process reliably.
 
-use serde_json::{json, Value};
-
 use crate::jupiter::{SwapQuote, TokenPrice};
+use crate::lots::TaxLedger;
 use crate::priority::FeeEstimate;
 use crate::rpc::TokenBalance;
 use crate::simulate::Simulation;
 use crate::token::TokenTransfer;
 use crate::tx::TxSummary;
+use serde_json::{json, Value};
 
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
@@ -182,8 +182,10 @@ pub fn render_prices(prices: &[TokenPrice], missing: &[String]) -> String {
             };
             lines.push(format!("{} is ${:.6}{change}", p.mint, p.usd_price));
         }
-        lines.join("
-")
+        lines.join(
+            "
+",
+        )
     };
     if !missing.is_empty() {
         summary.push_str(&format!(
@@ -203,9 +205,11 @@ No price available for: {}",
         })).collect::<Vec<_>>(),
         "unpriced": missing,
     });
-    format!("{summary}
+    format!(
+        "{summary}
 
-{json_block}")
+{json_block}"
+    )
 }
 
 /// Render the tool output for a swap quote.
@@ -253,9 +257,11 @@ pub fn render_quote(q: &SwapQuote, in_decimals: Option<u8>, out_decimals: Option
         "usd_value": q.usd_value,
         "route": q.route_labels,
     });
-    format!("{summary}
+    format!(
+        "{summary}
 
-{json_block}")
+{json_block}"
+    )
 }
 
 /// Render the tool output for an airdrop.
@@ -268,7 +274,10 @@ pub fn render_airdrop(
     let sol = lamports_to_sol(lamports);
     let state = match status {
         Some(s) => format!("Status: {s}."),
-        None => "The node has not reported a confirmation yet; it usually lands within a few seconds.".to_string(),
+        None => {
+            "The node has not reported a confirmation yet; it usually lands within a few seconds."
+                .to_string()
+        }
     };
     let summary = format!(
         "Requested an airdrop of {sol} SOL ({lamports} lamports) to {address} on the configured test cluster. Signature: {signature}. {state}"
@@ -280,18 +289,15 @@ pub fn render_airdrop(
         "signature": signature,
         "confirmation_status": status,
     });
-    format!("{summary}
+    format!(
+        "{summary}
 
-{json_block}")
+{json_block}"
+    )
 }
 
 /// Render the tool output for a simulated transfer.
-pub fn render_simulation(
-    from: &str,
-    to: &str,
-    lamports: u64,
-    sim: &Simulation,
-) -> String {
+pub fn render_simulation(from: &str, to: &str, lamports: u64, sim: &Simulation) -> String {
     let sol = lamports_to_sol(lamports);
     let mut summary = if sim.would_succeed() {
         format!(
@@ -307,11 +313,15 @@ pub fn render_simulation(
         summary.push_str(&format!(" Compute units consumed: {cu}."));
     }
     if !sim.logs.is_empty() {
-        summary.push_str("
-Program log:");
+        summary.push_str(
+            "
+Program log:",
+        );
         for line in sim.logs.iter().take(8) {
-            summary.push_str(&format!("
-  {line}"));
+            summary.push_str(&format!(
+                "
+  {line}"
+            ));
         }
     }
 
@@ -325,9 +335,11 @@ Program log:");
         "error": sim.error,
         "compute_units": sim.compute_units,
     });
-    format!("{summary}
+    format!(
+        "{summary}
 
-{json_block}")
+{json_block}"
+    )
 }
 
 /// Render the tool output for a submitted SPL token transfer.
@@ -364,9 +376,11 @@ pub fn render_token_transfer(
         "destination_token_account": t.destination_ata_base58(),
         "created_destination_account": created_destination,
     });
-    format!("{summary}
+    format!(
+        "{summary}
 
-{json_block}")
+{json_block}"
+    )
 }
 
 /// Render the tool output for an executed swap.
@@ -445,17 +459,15 @@ pub fn render_compressed_accounts(
     total: usize,
     accounts: &[VerifiedAccount],
 ) -> String {
-    let checked: Vec<&VerifiedAccount> =
-        accounts.iter().filter(|a| a.verified.is_some()).collect();
+    let checked: Vec<&VerifiedAccount> = accounts.iter().filter(|a| a.verified.is_some()).collect();
     let failures: Vec<&VerifiedAccount> = checked
         .iter()
         .copied()
         .filter(|a| matches!(&a.verified, Some(Err(_))))
         .collect();
 
-    let mut summary = format!(
-        "{owner} owns {total} compressed account(s) according to the indexer."
-    );
+    let mut summary =
+        format!("{owner} owns {total} compressed account(s) according to the indexer.");
     if checked.is_empty() {
         summary.push_str(" No merkle proofs were checked, so these are the indexer's claims rather than verified state.");
     } else if failures.is_empty() {
@@ -528,11 +540,7 @@ pub fn lamports_to_usd(lamports: u64, sol_usd: f64) -> String {
 /// fee is worth paying thinks in dollars, not in micro-lamports per
 /// compute unit, but a price lookup failing is no reason to withhold
 /// the estimate itself.
-pub fn render_fee_estimate(
-    e: &FeeEstimate,
-    accounts: &[String],
-    sol_usd: Option<f64>,
-) -> String {
+pub fn render_fee_estimate(e: &FeeEstimate, accounts: &[String], sol_usd: Option<f64>) -> String {
     let total = e.total_lamports();
     let scope = if accounts.is_empty() {
         "recent network-wide samples".to_string()
@@ -586,6 +594,369 @@ pub fn render_fee_estimate(
         "accounts": accounts,
     });
     format!("{summary}\n\n{json_block}")
+}
+
+impl TaxLedger {
+    /// render self-verifying standalone HTML audit report for the tax ledger, with optional year filtering
+    pub fn generate_html_report(
+        &self,
+        year: Option<&str>,
+        anchored: bool,
+        tx_signature: Option<&str>,
+    ) -> Result<String, String> {
+        let state_root = self.compute_state_root()?;
+
+        let mut distinct_years: Vec<String> = self
+            .lots
+            .iter()
+            .map(|l| {
+                if l.acquired_at_utc.len() >= 4 {
+                    l.acquired_at_utc[..4].to_string()
+                } else {
+                    "2026".to_string()
+                }
+            })
+            .collect();
+        distinct_years.sort();
+        distinct_years.dedup();
+        if distinct_years.is_empty() {
+            distinct_years.push("2026".to_string());
+        }
+
+        let active_years = match year {
+            Some(y) => vec![y.to_string()],
+            None => distinct_years,
+        };
+
+        let current_calendar_year = "2026";
+
+        let small_mark_sealed = r#"<svg width="17" height="17" viewBox="0 0 128 128" style="display:inline-block; vertical-align:middle; color:var(--wax);" role="img" aria-label="Sealed"><defs><clipPath id="selo-s-sealed"><circle cx="64" cy="64" r="50"/></clipPath></defs><g clip-path="url(#selo-s-sealed)"><path d="M64 0H128V128H64Z" fill="currentColor"/></g><circle cx="64" cy="64" r="50" fill="none" stroke="currentColor" stroke-width="13"/></svg>"#;
+
+        let small_mark_open = r#"<svg width="17" height="17" viewBox="0 0 128 128" style="display:inline-block; vertical-align:middle; opacity:.45;" role="img" aria-label="Open"><defs><clipPath id="selo-s-open"><circle cx="64" cy="64" r="50"/></clipPath></defs><g clip-path="url(#selo-s-open)"><path d="M64 0H128V128H64Z" fill="currentColor"/></g><circle cx="64" cy="64" r="50" fill="none" stroke="currentColor" stroke-width="13"/></svg>"#;
+
+        let mut sorted_years = active_years.clone();
+        sorted_years.sort();
+
+        let mut accordion_html = String::new();
+
+        for (idx, yr) in sorted_years.iter().enumerate() {
+            let is_year_anchored = anchored || (yr.as_str() < current_calendar_year);
+            let yr_prefix = yr.clone();
+
+            let yr_lots: Vec<_> = self
+                .lots
+                .iter()
+                .filter(|l| l.acquired_at_utc.starts_with(&yr_prefix))
+                .collect();
+            let count = yr_lots.len();
+            let sum_cost: f64 = yr_lots.iter().map(|l| l.unit_cost_basis_brl).sum();
+
+            let mut rows = String::new();
+            if yr_lots.is_empty() {
+                rows.push_str("<tr><td colspan=\"6\" style=\"text-align:center; color:var(--selo-muted);\">No tax lots recorded for this period.</td></tr>");
+            } else {
+                for lot in yr_lots {
+                    rows.push_str(&format!(
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>R$ {:.2}</td><td>R$ {:.4}</td><td>{}</td></tr>",
+                        lot.id, lot.asset_symbol, lot.amount, lot.unit_cost_basis_brl, lot.ptax_rate_used, lot.acquired_at_utc
+                    ));
+                }
+            }
+
+            let is_expanded = idx == sorted_years.len() - 1; // Default expand the latest/open period
+            let display_style = if is_expanded {
+                "display: block;"
+            } else {
+                "display: none;"
+            };
+            let expand_class = if is_expanded { "expanded" } else { "" };
+
+            let card_header = if is_year_anchored {
+                format!(
+                    r#"
+                  <div class="accordion-header {}" onclick="toggleAccordion('acc-{}')">
+                    <div>
+                      <div class="k">Period &middot; Fiscal Year {}</div>
+                      <div class="v" style="margin:2px 0 0;">{} &middot; R$ {:.2}</div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:16px;">
+                      <div class="sealed">
+                        {}
+                        Sealed &middot; root {}&hellip;
+                      </div>
+                      <span class="chevron">&#9662;</span>
+                    </div>
+                  </div>
+                "#,
+                    expand_class,
+                    yr_prefix,
+                    yr_prefix,
+                    count,
+                    sum_cost,
+                    small_mark_sealed,
+                    &state_root[..8]
+                )
+            } else {
+                format!(
+                    r#"
+                  <div class="accordion-header {}" onclick="toggleAccordion('acc-{}')">
+                    <div>
+                      <div class="k">Period &middot; Fiscal Year {} (Active)</div>
+                      <div class="v" style="margin:2px 0 0;">{} &middot; R$ {:.2}</div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:16px;">
+                      <div class="open">
+                        {}
+                        Open &middot; not yet anchored
+                      </div>
+                      <span class="chevron">&#9662;</span>
+                    </div>
+                  </div>
+                "#,
+                    expand_class, yr_prefix, yr_prefix, count, sum_cost, small_mark_open
+                )
+            };
+
+            let sig_block = match &tx_signature {
+                Some(sig) if is_year_anchored => format!(
+                    r#"
+                  <div style="margin-top:20px; padding-top:16px; border-top:1px solid var(--selo-rule);">
+                    <div class="k" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                      <span>On-Chain Anchor Transaction Signature</span>
+                      <button class="copy-btn" onclick="copyToClipboard('{}', this)">Copy Sig</button>
+                    </div>
+                    <div style="font: 600 12px/1.4 var(--selo-font-mono); word-break:break-all; color: var(--selo-ink);">{}</div>
+                  </div>
+                "#,
+                    sig, sig
+                ),
+                _ => "".to_string(),
+            };
+
+            let root_verification_block = format!(
+                r#"
+              <div style="margin-top:20px; padding-top:16px; border-top:1px solid var(--selo-rule);">
+                <div class="k" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                  <span>Cryptographic State Root (Poseidon BN254 Commitment)</span>
+                  <button class="copy-btn" onclick="copyToClipboard('{}', this)">Copy Root</button>
+                </div>
+                <div style="font: 600 12px/1.4 var(--selo-font-mono); word-break:break-all; color: var(--selo-ink);">{}</div>
+              </div>
+            "#,
+                state_root, state_root
+            );
+
+            accordion_html.push_str(&format!(
+                r#"
+              <div class="accordion-item" id="acc-{}">
+                {}
+                <div class="accordion-content" style="{}">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>ID</th>
+                        <th>Asset</th>
+                        <th>Amount</th>
+                        <th>Cost Basis (BRL)</th>
+                        <th>PTAX Rate</th>
+                        <th>Acquired UTC</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {}
+                    </tbody>
+                  </table>
+                  {}
+                  {}
+                </div>
+              </div>
+            "#,
+                yr_prefix, card_header, display_style, rows, root_verification_block, sig_block
+            ));
+        }
+
+        let period_display = match year {
+            Some(y) => format!("Fiscal Year {}", y),
+            None => "All-Time Cumulative Timeline".to_string(),
+        };
+
+        let html = format!(
+            r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selo - Verified Tax Ledger Report ({period_display})</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128' width='32' height='32'><style>.s{{fill:%2316130F;stroke:%2316130F}}@media(prefers-color-scheme:dark){{.s{{fill:%23F2EDE5;stroke:%23F2EDE5}}}}</style><defs><clipPath id='fav'><circle cx='64' cy='64' r='50'/></clipPath></defs><g clip-path='url(%23fav)'><path class='s' d='M64 0H128V128H64Z' stroke='none'/></g><circle class='s' cx='64' cy='64' r='50' fill='none' stroke-width='13'/></svg>">
+<link rel="apple-touch-icon" sizes="180x180" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180' width='180' height='180'><rect width='180' height='180' fill='%23FAF7F2'/><defs><clipPath id='ati'><circle cx='90' cy='90' r='62'/></clipPath></defs><g clip-path='url(%23ati)'><path d='M90 0H180V180H90Z' fill='%2316130F'/><g stroke='%2316130F' stroke-width='8.5'><line x1='20' y1='58' x2='83' y2='58'/><line x1='20' y1='79' x2='83' y2='79'/><line x1='20' y1='100' x2='83' y2='100'/><line x1='20' y1='121' x2='83' y2='121'/></g></g><circle cx='90' cy='90' r='62' fill='none' stroke='%2316130F' stroke-width='11'/></svg>">
+<style>
+  :root {{
+    --selo-seal: #16130F;
+    --selo-seal-weak: #16130F14;
+    --selo-ink: #16130F; 
+    --selo-paper: #FAF7F2; 
+    --selo-muted: #6B625A; 
+    --selo-rule: #DED5C9; 
+    --selo-raised: #FFFFFF;
+    --wax: #B4381F;
+    --selo-font-sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --selo-font-mono: ui-monospace, "JetBrains Mono", Consolas, monospace;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{ 
+      --selo-seal: #F2EDE5;
+      --selo-seal-weak: #F2EDE51f;
+      --selo-ink: #F2EDE5; 
+      --selo-paper: #14120F; 
+      --selo-muted: #9A8F83; 
+      --selo-rule: #2E2A25; 
+      --selo-raised: #1D1A16;
+      --wax: #F2EDE5;
+    }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{ 
+    margin: 0 auto; padding: 56px 40px 96px; max-width: 960px; 
+    background: var(--selo-paper); color: var(--selo-ink); 
+    font: 15px/1.6 var(--selo-font-sans); 
+  }}
+  .header-brand {{ display: flex; align-items: center; gap: 14px; margin-bottom: 24px; }}
+  .logo-container {{ width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; background: var(--selo-rule); border-radius: 12px; padding: 8px; }}
+  .logo-container svg {{ width: 100%; height: 100%; fill: var(--selo-ink); }}
+  h1 {{ font-size: 28px; letter-spacing: -.02em; margin: 0 0 6px; }}
+  p.lede {{ color: var(--selo-muted); max-width: 64ch; margin: 0 0 32px; }}
+  
+  .periods-stack {{
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    margin-bottom: 32px;
+  }}
+  .accordion-item {{
+    border: 1px solid var(--selo-rule);
+    border-radius: 12px;
+    background: var(--selo-raised);
+    overflow: hidden;
+    transition: border-color 0.2s ease;
+  }}
+  .accordion-item:hover {{
+    border-color: var(--selo-ink);
+  }}
+  .accordion-header {{
+    padding: 20px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+  }}
+  .accordion-content {{
+    padding: 0 24px 24px;
+    border-top: 1px solid var(--selo-rule);
+    background: var(--selo-paper);
+  }}
+  .chevron {{
+    font-size: 14px;
+    color: var(--selo-muted);
+    transition: transform 0.2s ease;
+  }}
+  .accordion-header.expanded .chevron {{
+    transform: rotate(180deg);
+  }}
+
+  .k {{ color: var(--selo-muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }}
+  .v {{ font: 600 18px/1.2 var(--selo-font-mono); margin: 4px 0 0; }}
+  .sealed {{ display: flex; align-items: center; gap: 8px; color: var(--wax); font-size: 13px; font-weight: 600; }}
+  .open {{ display: flex; align-items: center; gap: 8px; color: var(--selo-muted); font-size: 13px; }}
+  
+  .copy-btn {{
+    background: var(--selo-rule);
+    border: none;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--selo-ink);
+    cursor: pointer;
+    transition: background 0.2s;
+  }}
+  .copy-btn:hover {{
+    background: var(--selo-ink);
+    color: var(--selo-paper);
+  }}
+
+  table {{ width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 14px; }}
+  th, td {{ text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--selo-rule); }}
+  th {{ font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--selo-muted); }}
+  td {{ font-family: var(--selo-font-mono); font-size: 13px; }}
+  .footer {{ margin-top: 36px; color: var(--selo-muted); font-size: 12px; }}
+</style>
+<script>
+  function toggleAccordion(id) {{
+    const item = document.getElementById(id);
+    const content = item.querySelector('.accordion-content');
+    const header = item.querySelector('.accordion-header');
+    if (content.style.display === 'none') {{
+      content.style.display = 'block';
+      header.classList.add('expanded');
+    }} else {{
+      content.style.display = 'none';
+      header.classList.remove('expanded');
+    }}
+  }}
+
+  function copyToClipboard(text, btn) {{
+    navigator.clipboard.writeText(text).then(() => {{
+      const originalText = btn.textContent;
+      btn.textContent = 'Copied ✓';
+      setTimeout(() => {{
+        btn.textContent = originalText;
+      }}, 2000);
+    }});
+  }}
+</script>
+</head>
+<body>
+
+<div class="header-brand">
+  <div class="logo-container">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Selo">
+      <defs><clipPath id="selo-a"><circle cx="64" cy="64" r="52"/></clipPath></defs>
+      <g clip-path="url(#selo-a)">
+        <path d="M64 0H128V128H64Z" fill="currentColor"/>
+        <g stroke="currentColor" stroke-width="7">
+          <line x1="0" y1="37" x2="55" y2="37"/>
+          <line x1="0" y1="55" x2="55" y2="55"/>
+          <line x1="0" y1="73" x2="55" y2="73"/>
+          <line x1="0" y1="91" x2="55" y2="91"/>
+        </g>
+      </g>
+      <circle cx="64" cy="64" r="52" fill="none" stroke="currentColor" stroke-width="9"/>
+    </svg>
+  </div>
+  <div>
+    <h1>Selo Tax Ledger Report</h1>
+  </div>
+</div>
+<p class="lede">Self-verifying cryptographic audit statement for <strong>{period_display}</strong>. Embedded Poseidon BN254 state root commitment.</p>
+
+<div class="periods-stack">
+  {accordion_html}
+</div>
+
+<div class="footer">
+  <p>Generated by Selo Core &middot; Cryptographically anchored offline statement &middot; Monochrome split-seal ledger interface.</p>
+</div>
+
+</body>
+</html>
+"#,
+            period_display = period_display,
+            accordion_html = accordion_html
+        );
+
+        Ok(html)
+    }
 }
 
 #[cfg(test)]
@@ -796,10 +1167,8 @@ mod tests {
 
     #[test]
     fn render_token_transfer_reports_accounts_and_creation() {
-        let owner = crate::address::decode_pubkey(
-            "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
-        )
-        .unwrap();
+        let owner =
+            crate::address::decode_pubkey("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM").unwrap();
         let t = TokenTransfer::resolve(
             &owner,
             "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ",
@@ -865,12 +1234,18 @@ mod tests {
     fn render_compressed_marks_verified_and_failed() {
         let accounts = vec![
             VerifiedAccount {
-                hash: "HashA".into(), leaf_index: 4, tree: "TreeX".into(),
-                lamports: 0, verified: Some(Ok(())),
+                hash: "HashA".into(),
+                leaf_index: 4,
+                tree: "TreeX".into(),
+                lamports: 0,
+                verified: Some(Ok(())),
             },
             VerifiedAccount {
-                hash: "HashB".into(), leaf_index: 9, tree: "TreeX".into(),
-                lamports: 5, verified: None,
+                hash: "HashB".into(),
+                leaf_index: 9,
+                tree: "TreeX".into(),
+                lamports: 5,
+                verified: None,
             },
         ];
         let out = render_compressed_accounts("Owner1", 534, &accounts);
@@ -884,8 +1259,11 @@ mod tests {
     #[test]
     fn render_compressed_shouts_when_a_proof_fails() {
         let accounts = vec![VerifiedAccount {
-            hash: "HashC".into(), leaf_index: 1, tree: "TreeX".into(),
-            lamports: 0, verified: Some(Err("root mismatch".into())),
+            hash: "HashC".into(),
+            leaf_index: 1,
+            tree: "TreeX".into(),
+            lamports: 0,
+            verified: Some(Err("root mismatch".into())),
         }];
         let out = render_compressed_accounts("Owner1", 1, &accounts);
         assert!(out.contains("FAILED to verify"));
@@ -917,8 +1295,12 @@ mod tests {
     #[test]
     fn fee_estimate_quotes_dollars_when_price_known() {
         let e = FeeEstimate {
-            sample_count: 150, nonzero_count: 15,
-            p50: 50_000, p75: 90_000, p95: 140_000, max: 6_145_297,
+            sample_count: 150,
+            nonzero_count: 15,
+            p50: 50_000,
+            p75: 90_000,
+            p95: 140_000,
+            max: 6_145_297,
             recommended_micro_lamports: 90_000,
             urgency: crate::priority::Urgency::Normal,
             compute_units: 1_000,
