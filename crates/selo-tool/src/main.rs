@@ -83,6 +83,7 @@ fn format_timestamp_utc(unix_secs: u64) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn save_tax_ledger(ledger: &selo_core::lots::TaxLedger) {
     if let Ok(data) = serde_json::to_string_pretty(ledger) {
         let _ = std::fs::write("tax_ledger.json", data);
@@ -109,6 +110,7 @@ fn main() -> Result<(), String> {
         println!("  backfill <pubkey>                                Paginate and list historical transactions");
         println!("  ingest <pubkey>                                  Parse transactions, calculate balance deltas & classify ledger events");
         println!("  blockhash                                        Fetch latest blockhash");
+        println!("  anchor --nonce <pubkey> --authority <pubkey>     Generate unsigned durable-nonce anchor transaction for ZK state root");
         return Ok(());
     }
 
@@ -559,26 +561,71 @@ fn main() -> Result<(), String> {
         },
         "tax-report" => {
             let ledger = load_tax_ledger();
-            let report_output = ledger.generate_report();
-            println!("{}", report_output);
-        }
-        "record-sample" => {
-            let mut ledger = load_tax_ledger();
-
-            // Record 1 SOL (1,000,000,000 lamports) acquired today & pull the live PTAX rate automatically
-            match ledger.record_acquisition(
-                "lot-SOL-001".to_string(),
-                "SOL".to_string(),
-                1_000_000_000,
-                "2026-08-04T12:00:00Z".to_string(),
-            ) {
-                Ok(()) => {
-                    save_tax_ledger(&ledger);
-                    println!("✓ Sample acquisition recorded successfully using current PTAX rate!");
-                }
-                Err(e) => println!("✗ Failed to record acquisition: {}", e),
+            match ledger.generate_report() {
+                Ok(report_output) => println!("{}", report_output),
+                Err(e) => println!("✗ Failed to generate tax report: {}", e),
             }
         }
+        "anchor" => {
+            let mut nonce_account = String::new();
+            let mut authority = String::new();
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--nonce" => {
+                        if let Some(val) = args.get(i + 1) {
+                            nonce_account = val.clone();
+                        }
+                        i += 2;
+                    }
+                    "--authority" => {
+                        if let Some(val) = args.get(i + 1) {
+                            authority = val.clone();
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+
+            if nonce_account.is_empty() || authority.is_empty() {
+                return Err("Missing required arguments. Usage: selo-tool anchor --nonce <pubkey> --authority <pubkey>".to_string());
+            }
+
+            let ledger = load_tax_ledger();
+            let state_root = ledger.compute_state_root()?;
+
+            let anchor_tx =
+                selo_core::nonce::build_anchor_transaction(&nonce_account, &authority, &state_root);
+
+            println!("✓ Unsigned Anchor Transaction Generated Successfully");
+            println!("  State Root (Poseidon BN254): {}", anchor_tx.state_root);
+            println!("  Durable Nonce Account     : {}", anchor_tx.nonce_account);
+            println!("  Nonce Authority           : {}", anchor_tx.authority);
+            println!("  Status                    : Awaiting human signature (Never expires via durable nonce)");
+            println!("------------------------------------------------------------");
+            let json_output =
+                serde_json::to_string_pretty(&anchor_tx).map_err(|e| e.to_string())?;
+            println!("{}", json_output);
+        }
+        // "record-sample" => {
+        //     let mut ledger = load_tax_ledger();
+
+        //     // Record 1 SOL (1,000,000,000 lamports) acquired today & pull the live PTAX rate automatically
+        //     match ledger.record_acquisition(
+        //         "lot-SOL-001".to_string(),
+        //         "SOL".to_string(),
+        //         1_000_000_000,
+        //         "2026-08-04T12:00:00Z".to_string(),
+        //     ) {
+        //         Ok(()) => {
+        //             save_tax_ledger(&ledger);
+        //             println!("✓ Sample acquisition recorded successfully using current PTAX rate!");
+        //         }
+        //         Err(e) => println!("✗ Failed to record acquisition: {}", e),
+        //     }
+        // }
         _ => {
             println!("Unknown command: {}", args[1]);
         }

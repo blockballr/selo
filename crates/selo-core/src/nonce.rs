@@ -13,6 +13,7 @@ pub struct NonceState {
 }
 
 /// rotating a durable nonce
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NonceInstruction {
     pub program_id: String,
     pub nonce_account: String,
@@ -26,6 +27,34 @@ impl NonceInstruction {
             nonce_account: nonce_account.to_string(),
             authority: authority.to_string(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchorTransactionData {
+    pub nonce_account: String,
+    pub authority: String,
+    pub state_root: String,
+    pub instructions: Vec<NonceInstruction>,
+    pub description: String,
+}
+
+/// unsigned anchor transaction payload embedding the Poseidon state root and durable nonce
+pub fn build_anchor_transaction(
+    nonce_account: &str,
+    authority: &str,
+    state_root: &str,
+) -> AnchorTransactionData {
+    let nonce_ix = NonceInstruction::new(nonce_account, authority);
+    AnchorTransactionData {
+        nonce_account: nonce_account.to_string(),
+        authority: authority.to_string(),
+        state_root: state_root.to_string(),
+        instructions: vec![nonce_ix],
+        description: format!(
+            "Unsigned anchor transaction for Poseidon BN254 state root: {}. Secured with durable nonce account: {}",
+            state_root, nonce_account
+        ),
     }
 }
 
@@ -62,5 +91,14 @@ mod tests {
         assert_eq!(instruction.program_id, "11111111111111111111111111111111");
         assert_eq!(instruction.nonce_account, "TestNonceAcc");
         assert_eq!(instruction.authority, "TestAuthAcc");
+    }
+
+    #[test]
+    fn test_anchor_transaction_builder() {
+        let tx_data = build_anchor_transaction("NonceAcc123", "AuthAcc456", "0x153d04");
+        assert_eq!(tx_data.nonce_account, "NonceAcc123");
+        assert_eq!(tx_data.authority, "AuthAcc456");
+        assert_eq!(tx_data.state_root, "0x153d04");
+        assert_eq!(tx_data.instructions.len(), 1);
     }
 }
