@@ -56,6 +56,12 @@ fn generate_reference_key(now_unix: u64, amount: u64) -> String {
     let result = hasher.finalize();
     bs58::encode(result).into_string()
 }
+fn load_tax_ledger() -> selo_core::lots::TaxLedger {
+    std::fs::read_to_string("tax_ledger.json")
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_else(selo_core::lots::TaxLedger::new)
+}
 
 fn format_timestamp_utc(unix_secs: u64) -> String {
     let secs_per_day: u64 = 86400;
@@ -75,6 +81,12 @@ fn format_timestamp_utc(unix_secs: u64) -> String {
         hours,
         mins
     )
+}
+
+fn save_tax_ledger(ledger: &selo_core::lots::TaxLedger) {
+    if let Ok(data) = serde_json::to_string_pretty(ledger) {
+        let _ = std::fs::write("tax_ledger.json", data);
+    }
 }
 
 fn main() -> Result<(), String> {
@@ -539,6 +551,32 @@ fn main() -> Result<(), String> {
                 }
             } else {
                 println!("✗ Quote [{}] not found in store.", quote_id);
+            }
+        }
+        "ptax" => match selo_core::ptax::fetch_latest_ptax() {
+            Ok(rate) => println!("✓ Current BCB PTAX USD/BRL Rate: R$ {:.4}", rate),
+            Err(e) => println!("✗ Error fetching PTAX rate: {}", e),
+        },
+        "tax-report" => {
+            let ledger = load_tax_ledger();
+            let report_output = ledger.generate_report();
+            println!("{}", report_output);
+        }
+        "record-sample" => {
+            let mut ledger = load_tax_ledger();
+
+            // Record 1 SOL (1,000,000,000 lamports) acquired today & pull the live PTAX rate automatically
+            match ledger.record_acquisition(
+                "lot-SOL-001".to_string(),
+                "SOL".to_string(),
+                1_000_000_000,
+                "2026-08-04T12:00:00Z".to_string(),
+            ) {
+                Ok(()) => {
+                    save_tax_ledger(&ledger);
+                    println!("✓ Sample acquisition recorded successfully using current PTAX rate!");
+                }
+                Err(e) => println!("✗ Failed to record acquisition: {}", e),
             }
         }
         _ => {
