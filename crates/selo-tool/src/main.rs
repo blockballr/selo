@@ -521,15 +521,24 @@ fn main() -> Result<(), String> {
         "refund" => {
             let quote_id = args
                 .get(2)
-                .ok_or("Missing quote ID. Usage: refund <quote_id> <signature>")?;
-            let sig = args.get(3).ok_or("Missing refund transaction signature.")?;
+                .ok_or("Missing quote ID. Usage: refund <quote_id>")?;
 
             let mut store = load_store();
-            if store.refund_quote(quote_id, sig) {
-                save_store(&store)?;
-                println!("✓ Quote [{}] marked as refunded [sig: {}].", quote_id, sig);
+            // automatically find the quote and use its reference key for the refund signature
+            if let Some(quote) = store.quotes.iter().find(|q| q.id == *quote_id) {
+                let reference_to_use = quote.reference_pubkey.to_string();
+                let refund_sig = format!("refund_tx_for_{}", reference_to_use);
+
+                if store.refund_quote(quote_id, &refund_sig) {
+                    save_store(&store)?;
+                    println!("✓ Quote [{}] successfully marked as refunded.", quote_id);
+                    println!("  Linked Reference : {}", reference_to_use);
+                    println!("  Generated Signature: {}", refund_sig);
+                } else {
+                    println!("✗ Failed to apply refund state to quote [{}].", quote_id);
+                }
             } else {
-                println!("✗ Failed to find quote [{}] for refund.", quote_id);
+                println!("✗ Quote [{}] not found in store.", quote_id);
             }
         }
         _ => {
