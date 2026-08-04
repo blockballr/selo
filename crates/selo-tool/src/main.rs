@@ -57,6 +57,26 @@ fn generate_reference_key(now_unix: u64, amount: u64) -> String {
     bs58::encode(result).into_string()
 }
 
+fn format_timestamp_utc(unix_secs: u64) -> String {
+    let secs_per_day: u64 = 86400;
+    let days_since_epoch = unix_secs / secs_per_day;
+    let year = 1970 + (days_since_epoch / 365);
+    let remainder_days = days_since_epoch % 365;
+    let month = (remainder_days / 30) + 1;
+    let day = (remainder_days % 30) + 1;
+    let hours = (unix_secs % secs_per_day) / 3600;
+    let mins = (unix_secs % 3600) / 60;
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        year,
+        month.min(12),
+        day.min(31),
+        hours,
+        mins
+    )
+}
+
 fn main() -> Result<(), String> {
     dotenvy::dotenv().ok();
     let args: Vec<String> = env::args().collect();
@@ -194,10 +214,15 @@ fn main() -> Result<(), String> {
             store.updated_at = now;
             save_store(&store)?;
 
+            let readable_expire = format_timestamp_utc(expires_at); // conversion human-readable time
+
             println!("✓ Quote Issued Successfully [{}]", quote_id);
             println!("  Reference Key : {}", ref_key);
             println!("  Solana Pay URI: {}", pay_url);
-            println!("  Expires At    : {}", expires_at);
+            println!(
+                "  Expires At    : {} (utc: {})",
+                expires_at, readable_expire
+            );
         }
         "check" => {
             let now = SystemTime::now()
@@ -477,6 +502,35 @@ fn main() -> Result<(), String> {
         "blockhash" => {
             let hash = engine.rpc.get_latest_blockhash()?;
             println!("Latest blockhash: {}", hash);
+        }
+        "close" => {
+            let quote_id = args
+                .get(2)
+                .ok_or("Missing quote ID. Usage: close <quote_id>")?;
+            let mut store = load_store();
+            if store.close_quote(quote_id) {
+                save_store(&store)?;
+                println!("✓ Quote [{}] successfully closed.", quote_id);
+            } else {
+                println!(
+                    "✗ Failed to close quote [{}]. It may not exist or is no longer pending.",
+                    quote_id
+                );
+            }
+        }
+        "refund" => {
+            let quote_id = args
+                .get(2)
+                .ok_or("Missing quote ID. Usage: refund <quote_id> <signature>")?;
+            let sig = args.get(3).ok_or("Missing refund transaction signature.")?;
+
+            let mut store = load_store();
+            if store.refund_quote(quote_id, sig) {
+                save_store(&store)?;
+                println!("✓ Quote [{}] marked as refunded [sig: {}].", quote_id, sig);
+            } else {
+                println!("✗ Failed to find quote [{}] for refund.", quote_id);
+            }
         }
         _ => {
             println!("Unknown command: {}", args[1]);

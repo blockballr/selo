@@ -12,6 +12,11 @@ pub enum QuoteStatus {
         settled_at: u64,
     },
     Expired,
+    Closed, // manual overrides
+    Refunded {
+        signature: String,
+        refunded_at: u64, // tracking refund
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,6 +30,16 @@ pub struct QuoteRecord {
     pub status: QuoteStatus,
     pub label: Option<String>,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundRecord {
+    pub quote_id: String,
+    pub recipient: String,
+    pub amount_lamports: u64,
+    pub original_signature: String,
+    pub refund_signature: Option<String>,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -100,10 +115,38 @@ impl SeloStore {
                 QuoteStatus::Pending => summary.pending += 1,
                 QuoteStatus::Settled { .. } => summary.settled += 1,
                 QuoteStatus::Expired => summary.expired += 1,
+                QuoteStatus::Closed => {}
+                QuoteStatus::Refunded { .. } => {}
             }
         }
 
         summary
+    }
+
+    pub fn close_quote(&mut self, id: &str) -> bool {
+        if let Some(quote) = self.quotes.iter_mut().find(|q| q.id == id) {
+            if matches!(quote.status, QuoteStatus::Pending) {
+                quote.status = QuoteStatus::Closed;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn refund_quote(&mut self, id: &str, refund_signature: &str) -> bool {
+        if let Some(quote) = self.quotes.iter_mut().find(|q| q.id == id) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            quote.status = QuoteStatus::Refunded {
+                signature: refund_signature.to_string(),
+                refunded_at: now,
+            };
+            return true;
+        }
+        false
     }
 }
 
