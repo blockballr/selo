@@ -56,7 +56,6 @@ impl CounterpartyRegistry {
     pub fn new() -> Self {
         let mut rules = HashMap::new();
 
-        // core Solana system & SPL programs
         rules.insert(
             "11111111111111111111111111111111".to_string(),
             "Solana System Program".to_string(),
@@ -66,104 +65,40 @@ impl CounterpartyRegistry {
             "SPL Token Program".to_string(),
         );
         rules.insert(
-            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb".to_string(),
-            "SPL Token-2022 Program".to_string(),
-        );
-        rules.insert(
             "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".to_string(),
-            "SPL Associated Token Account Program".to_string(),
+            "Associated Token Program".to_string(),
         );
-        rules.insert(
-            "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr".to_string(),
-            "SPL Memo Program".to_string(),
-        );
-        rules.insert(
-            "ComputeBudget111111111111111111111111111111".to_string(),
-            "Compute Budget Program".to_string(),
-        );
-        rules.insert(
-            "Stake11111111111111111111111111111111111111".to_string(),
-            "Solana Stake Program".to_string(),
-        );
-
-        // DEX aggregators, AMMs & liquidity protocols
         rules.insert(
             "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),
             "Jupiter Aggregator v6".to_string(),
         );
         rules.insert(
-            "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string(),
-            "Raydium AMM v4".to_string(),
-        );
-        rules.insert(
-            "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string(),
-            "Raydium Concentrated Liquidity (CLMM)".to_string(),
-        );
-        rules.insert(
-            "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C".to_string(),
-            "Raydium CP Swap".to_string(),
-        );
-        rules.insert(
-            "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".to_string(),
-            "Orca Whirlpool".to_string(),
-        );
-        rules.insert(
-            "PhoeNiX2yFi2WBmcWZmqbLLBk3zp8V275rWxmMvhKE8".to_string(),
-            "Phoenix DEX".to_string(),
-        );
-        rules.insert(
             "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo".to_string(),
             "Meteora DLMM".to_string(),
         );
-
-        // lending, yield & liquid Staking Protocols
         rules.insert(
-            "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD".to_string(),
-            "Kamino Lending".to_string(),
+            "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string(),
+            "Raydium Liquidity Pool V4".to_string(),
         );
-        rules.insert(
-            "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA".to_string(),
-            "Marginfi v2".to_string(),
-        );
-        rules.insert(
-            "So1endDq2YkqhipRh3WViPa8hF5vqEGvMJNFo5yvh69".to_string(),
-            "Solend Protocol".to_string(),
-        );
-        rules.insert(
-            "Jitos7P2WnbxBxMV6g2fNJBDMEx8MGLEdR65ysgAh85".to_string(),
-            "Jito Stake Pool".to_string(),
-        );
-        rules.insert(
-            "MarBGuJHBdmhKwUZ9Bwb2vSgvo7vVIxNLWmqKzcFUCb".to_string(),
-            "Marinade Finance".to_string(),
-        );
-
-        // known stablecoin Mints & exchange hot wallets
         rules.insert(
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
-            "USD Coin (USDC)".to_string(),
+            "USDC Mint".to_string(),
         );
         rules.insert(
-            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".to_string(),
-            "Tether USD (USDT)".to_string(),
+            "BRAZAtTTzR2Es8c98hJvcngerTEyRGSdgkHU59n4A6GT".to_string(),
+            "Superteam Brazil Treasury".to_string(),
         );
         rules.insert(
-            "2b1kV6DkPAnxd5ixfnxCpjXM3W3Edbve3MxyEeqVR776".to_string(),
-            "PayPal USD (PYUSD)".to_string(),
-        );
-        rules.insert(
-            "2ojv9BAiA3hP8B82AGP8R2P8R8P8R8P8R8P8R8P8R8P8".to_string(),
-            "Binance Hot Wallet".to_string(),
+            "STBRgoYTmMwukhcBVjGpg3A4R9HBsrWo82wJgiBukaW".to_string(),
+            "Superteam Brazil Validator".to_string(),
         );
         Self { rules }
     }
 
-    /// Registers a new address mapping rule.
-    pub fn add_rule(&mut self, address: String, name: String) {
-        self.rules.insert(address, name);
+    pub fn add_rule(&mut self, pubkey: String, name: String) {
+        self.rules.insert(pubkey, name);
     }
 
-    /// Retrieves the label for an address, or returns a fallback default.
     pub fn get_name(&self, pubkey: &str) -> String {
         self.rules
             .get(pubkey)
@@ -171,15 +106,16 @@ impl CounterpartyRegistry {
             .unwrap_or_else(|| "Unknown Counterparty".to_string())
     }
 
-    /// address slicing
     pub fn format_address(&self, pubkey: &str) -> String {
-        let len = std::cmp::min(pubkey.len(), 8);
-        format!("{}...", &pubkey[..len])
+        if pubkey.len() > 12 {
+            format!("{}...", &pubkey[..12])
+        } else {
+            pubkey.to_string()
+        }
     }
 
     pub fn get_name_or_address(&self, pubkey: &str) -> String {
         self.rules.get(pubkey).cloned().unwrap_or_else(|| {
-            // DEBUG: calc safe slice length (min of address length or 8)
             let len = std::cmp::min(pubkey.len(), 8);
             format!("{}...", &pubkey[..len])
         })
@@ -196,26 +132,59 @@ pub struct Backfiller<'a, T: RpcSeam> {
     pub rpc: &'a T,
 }
 
-impl<'a, T: RpcSeam> Backfiller<'a, T> {
+impl<'a, T: crate::RpcSeam> Backfiller<'a, T> {
     pub fn new(rpc: &'a T) -> Self {
         Self { rpc }
     }
 
-    /// Fetches signatures for an address over the chain seam.
     pub fn backfill(&self, address: &str) -> Result<Vec<String>, String> {
+        self.backfill_with_limit(address, None)
+    }
+
+    pub fn backfill_with_limit(
+        &self,
+        address: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<String>, String> {
         let mut all_signatures = Vec::new();
+        let mut before_sig: Option<String> = None;
 
         loop {
-            let signatures = self.rpc.get_signatures(address)?;
+            if let Some(l) = limit {
+                if all_signatures.len() >= l {
+                    break;
+                }
+            }
 
-            if signatures.is_empty() {
+            let batch_size = match limit {
+                Some(l) => std::cmp::min(1000, l - all_signatures.len()),
+                None => 1000,
+            };
+
+            let batch =
+                self.rpc
+                    .get_signatures_paginated(address, before_sig.as_deref(), batch_size)?;
+            if batch.is_empty() {
                 break;
             }
 
-            all_signatures.extend(signatures);
+            let last_sig = match batch.last() {
+                Some(sig) => sig.clone(),
+                None => break,
+            };
 
-            // Break after initial pass for single-page RPC queries
-            break;
+            all_signatures.extend(batch);
+            before_sig = Some(last_sig);
+
+            if all_signatures.len() >= 10_000 && limit.is_none() {
+                break;
+            }
+        }
+
+        if let Some(l) = limit {
+            if all_signatures.len() > l {
+                all_signatures.truncate(l);
+            }
         }
 
         Ok(all_signatures)

@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::address::validate_pubkey;
 
-/// The system program id: 32 zero bytes.
+/// The system program id: 32 zero bytes / standard base58 representation.
 pub const SYSTEM_PROGRAM_ID: [u8; 32] = [0u8; 32];
 
 /// A parsed signing keypair plus its public key.
@@ -66,16 +66,17 @@ impl Keypair {
 }
 
 /// Encode a length as a Solana shortvec (compact-u16) prefix.
-pub fn shortvec(mut n: u16) -> Vec<u8> {
+pub fn shortvec(n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(3);
+    let mut val = n;
     loop {
-        let mut byte = (n & 0x7f) as u8;
-        n >>= 7;
-        if n != 0 {
+        let mut byte = (val & 0x7f) as u8;
+        val >>= 7;
+        if val != 0 {
             byte |= 0x80;
         }
         out.push(byte);
-        if n == 0 {
+        if val == 0 {
             return out;
         }
     }
@@ -103,10 +104,6 @@ pub struct PriorityFee {
 
 /// Build a transfer message, optionally prefixed with compute budget
 /// instructions that bid for block inclusion.
-///
-/// Compute budget instructions come before the transfer, and adding them
-/// changes the account layout: ComputeBudget becomes a fourth key and the
-/// readonly-unsigned count rises to two. Derived here, not hardcoded.
 pub fn build_transfer_message_with_priority(
     from: &[u8; 32],
     to: &str,
@@ -156,8 +153,6 @@ pub fn build_transfer_message_with_priority(
     msg.extend_from_slice(&shortvec(instruction_count));
 
     if let Some(p) = priority {
-        // The limit is set before the price so the price applies to a
-        // known ceiling. Neither instruction takes accounts.
         let cb_index = 3u8;
         for data in [
             crate::priority::set_compute_unit_limit_data(p.compute_units),
@@ -165,7 +160,7 @@ pub fn build_transfer_message_with_priority(
         ] {
             msg.push(cb_index);
             msg.extend_from_slice(&shortvec(0));
-            msg.extend_from_slice(&shortvec(data.len() as u16));
+            msg.extend_from_slice(&shortvec(data.len()));
             msg.extend_from_slice(&data);
         }
     }
@@ -179,7 +174,7 @@ pub fn build_transfer_message_with_priority(
     let mut data = Vec::with_capacity(12);
     data.extend_from_slice(&2u32.to_le_bytes());
     data.extend_from_slice(&lamports.to_le_bytes());
-    msg.extend_from_slice(&shortvec(data.len() as u16));
+    msg.extend_from_slice(&shortvec(data.len()));
     msg.extend_from_slice(&data);
     Ok(msg)
 }
@@ -216,8 +211,6 @@ pub fn parse_blockhash(body: &str) -> Result<String, String> {
 }
 
 /// Build a `sendTransaction` request for a base64-encoded transaction.
-/// Preflight simulation stays enabled, so obviously failing transfers
-/// are rejected by the RPC node before reaching a leader.
 pub fn send_request(tx_base64: &str) -> String {
     json!({
         "jsonrpc": "2.0",
@@ -242,7 +235,6 @@ mod tests {
     use ed25519_dalek::Verifier;
 
     fn test_keypair() -> Keypair {
-        // Deterministic test-only keypair from a fixed seed.
         let signing = SigningKey::from_bytes(&[7u8; 32]);
         Keypair { signing }
     }
@@ -252,7 +244,6 @@ mod tests {
     }
 
     const DEST: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-    // Any valid base58 32-byte value serves as a blockhash in tests.
     const BLOCKHASH: &str = "So11111111111111111111111111111111111111112";
 
     #[test]
@@ -292,18 +283,14 @@ mod tests {
         let from = kp.public_key_bytes();
         let msg = build_transfer_message(&from, DEST, 42, BLOCKHASH).unwrap();
 
-        // Header.
         assert_eq!(&msg[0..3], &[1, 0, 1]);
-        // Three account keys.
         assert_eq!(msg[3], 3);
         assert_eq!(&msg[4..36], &from);
         let dest_bytes = bs58::decode(DEST).into_vec().unwrap();
         assert_eq!(&msg[36..68], dest_bytes.as_slice());
         assert_eq!(&msg[68..100], &SYSTEM_PROGRAM_ID);
-        // Blockhash.
         let bh = bs58::decode(BLOCKHASH).into_vec().unwrap();
         assert_eq!(&msg[100..132], bh.as_slice());
-        // One instruction: program index 2, accounts [0,1], 12 data bytes.
         assert_eq!(&msg[132..137], &[1, 2, 2, 0, 1]);
         assert_eq!(msg[137], 12);
         assert_eq!(&msg[138..142], &2u32.to_le_bytes());
@@ -370,23 +357,19 @@ mod tests {
     fn priority_variant_layout_is_exact() {
         let kp = test_keypair();
         let from = kp.public_key_bytes();
-        let p = PriorityFee { micro_lamports_per_cu: 50_000, compute_units: 1_000 };
+        let p = PriorityFee {
+            micro_lamports_per_cu: 50_000,
+            compute_units: 1_000,
+        };
         let msg =
             build_transfer_message_with_priority(&from, DEST, 42, BLOCKHASH, Some(p)).unwrap();
 
-        // Two readonly unsigned programs now: system and compute budget.
         assert_eq!(&msg[0..3], &[1, 0, 2]);
         assert_eq!(msg[3], 4, "four account keys");
-        let cb = crate::address::decode_pubkey(
-            crate::priority::COMPUTE_BUDGET_PROGRAM_ID,
-        )
-        .unwrap();
+        let cb = crate::address::decode_pubkey(crate::priority::COMPUTE_BUDGET_PROGRAM_ID).unwrap();
         assert_eq!(&msg[100..132], &cb);
-        // Three instructions: limit, price, transfer.
         let ix_start = 4 + 4 * 32 + 32;
         assert_eq!(msg[ix_start], 3);
-        // First is the compute budget program (index 3), no accounts,
-        // 5 bytes of data.
         assert_eq!(&msg[ix_start + 1..ix_start + 4], &[3, 0, 5]);
         assert_eq!(msg[ix_start + 4], 2, "SetComputeUnitLimit");
     }
@@ -396,8 +379,7 @@ mod tests {
         let kp = test_keypair();
         let from = kp.public_key_bytes();
         let plain = build_transfer_message(&from, DEST, 42, BLOCKHASH).unwrap();
-        let none =
-            build_transfer_message_with_priority(&from, DEST, 42, BLOCKHASH, None).unwrap();
+        let none = build_transfer_message_with_priority(&from, DEST, 42, BLOCKHASH, None).unwrap();
         assert_eq!(plain, none);
         assert_eq!(plain.len(), 150);
     }
@@ -406,8 +388,13 @@ mod tests {
     fn priority_variant_still_validates_inputs() {
         let kp = test_keypair();
         let from = kp.public_key_bytes();
-        let p = PriorityFee { micro_lamports_per_cu: 1, compute_units: 1 };
+        let p = PriorityFee {
+            micro_lamports_per_cu: 1,
+            compute_units: 1,
+        };
         assert!(build_transfer_message_with_priority(&from, DEST, 0, BLOCKHASH, Some(p)).is_err());
-        assert!(build_transfer_message_with_priority(&from, "bad!", 1, BLOCKHASH, Some(p)).is_err());
+        assert!(
+            build_transfer_message_with_priority(&from, "bad!", 1, BLOCKHASH, Some(p)).is_err()
+        );
     }
 }

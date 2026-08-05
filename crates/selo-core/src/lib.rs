@@ -1,18 +1,7 @@
-//! Selo's core the money path, as pure Solana logic with no I/O
-//!
-//! The central accounting logic engine.
-//! designed to be transport-agnostic
-//!
-//! Everything here is I/O-free by design. An `RpcSeam` trait is used to
-//! define our network requirements, allowing the implementation to be
-//! swapped out for testing
-
 pub mod address;
-pub mod airdrop;
 pub mod basis;
 pub mod brain;
 pub mod catalog;
-// pub mod close;
 pub mod config;
 pub mod format;
 pub mod jupiter;
@@ -25,22 +14,16 @@ pub mod priority;
 pub mod ptax;
 pub mod quote;
 pub mod quotelog;
-pub mod refund;
 pub mod rpc;
-pub mod settle;
 pub mod simulate;
+pub mod solana_pay;
+pub mod store;
 pub mod token;
 pub mod transfer;
 pub mod tx;
 pub mod vtx;
 pub mod x402;
-// pub mod zk;
-pub mod solana_pay;
-pub mod store;
-
-pub use brain::*;
-pub use store::*;
-
+pub mod zk;
 use serde_json::Value;
 
 /// the interface for blockchain data access.
@@ -48,7 +31,20 @@ use serde_json::Value;
 pub trait RpcSeam {
     fn get_balance(&self, address: &str) -> Result<u64, String>;
     fn get_latest_blockhash(&self) -> Result<String, String>;
-    fn get_signatures(&self, address: &str) -> Result<Vec<String>, String>;
+
+    fn get_signatures(&self, address: &str) -> Result<Vec<String>, String> {
+        self.get_signatures_paginated(address, None, 25)
+    }
+
+    fn get_signatures_paginated(
+        &self,
+        address: &str,
+        _before: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<String>, String> {
+        self.get_signatures(address)
+    }
+
     fn get_transaction(&self, sig: &str) -> Result<Value, String>;
 }
 

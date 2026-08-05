@@ -11,7 +11,7 @@ impl ToolRpc {
             rpc_url: rpc_url.to_string(),
         }
     }
-    /// helper: perform JSON-RPC POST requests using ureq
+
     fn post(&self, payload: Value) -> Result<Value, String> {
         let response = ureq::post(&self.rpc_url)
             .header("Content-Type", "application/json")
@@ -62,11 +62,25 @@ impl RpcSeam for ToolRpc {
     }
 
     fn get_signatures(&self, address: &str) -> Result<Vec<String>, String> {
+        self.get_signatures_paginated(address, None, 25)
+    }
+
+    fn get_signatures_paginated(
+        &self,
+        address: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        let mut opts = json!({ "limit": limit });
+        if let Some(sig) = before {
+            opts["before"] = json!(sig);
+        }
+
         let payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getSignaturesForAddress",
-            "params": [address, { "limit": 25 }]
+            "params": [address, opts]
         });
 
         let res = self.post(payload)?;

@@ -21,22 +21,148 @@ pub struct AccountMeta {
 impl AccountMeta {
     /// A writable, signing account.
     pub fn signer_writable(pubkey: [u8; 32]) -> Self {
-        Self { pubkey, is_signer: true, is_writable: true }
+        Self {
+            pubkey,
+            is_signer: true,
+            is_writable: true,
+        }
     }
 
     /// A signing account that is only read.
     pub fn signer_readonly(pubkey: [u8; 32]) -> Self {
-        Self { pubkey, is_signer: true, is_writable: false }
+        Self {
+            pubkey,
+            is_signer: true,
+            is_writable: false,
+        }
     }
 
     /// A writable account that does not sign, such as a PDA.
     pub fn writable(pubkey: [u8; 32]) -> Self {
-        Self { pubkey, is_signer: false, is_writable: true }
+        Self {
+            pubkey,
+            is_signer: false,
+            is_writable: true,
+        }
     }
 
     /// An account that is only read, such as a program or a mint.
     pub fn readonly(pubkey: [u8; 32]) -> Self {
-        Self { pubkey, is_signer: false, is_writable: false }
+        Self {
+            pubkey,
+            is_signer: false,
+            is_writable: false,
+        }
+    }
+}
+
+pub struct TokenTransferParams {
+    pub sender: [u8; 32],
+    pub recipient: [u8; 32],
+    pub mint: [u8; 32],
+    pub amount: u64,
+    pub blockhash: [u8; 32],
+}
+
+/// build an SPL token transfer message.
+pub fn build_token_transfer_message(params: &TokenTransferParams) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(200);
+
+    // Header: 1 signature, 0 readonly signed, 1 readonly unsigned
+    msg.extend_from_slice(&[1, 0, 1]);
+
+    // account keys: sender, recipient, mint, token program, system program
+    let keys = vec![
+        params.sender,
+        params.recipient,
+        params.mint,
+        [
+            208, 197, 190, 11, 155, 29, 153, 138, 170, 9, 204, 18, 178, 203, 11, 137, 7, 241, 163,
+            169, 193, 170, 75, 149, 103, 17, 208, 12, 0, 0, 0, 0,
+        ], // SPL Token Program ID approx stub
+        [0u8; 32], // system program
+    ];
+
+    msg.extend_from_slice(&shortvec(keys.len()));
+    for key in &keys {
+        msg.extend_from_slice(key);
+    }
+
+    msg.extend_from_slice(&params.blockhash);
+
+    // Instruction data for transfer checked / transfer
+    let mut data = Vec::with_capacity(9);
+    data.push(3); // Transfer instruction discriminant
+    data.extend_from_slice(&params.amount.to_le_bytes());
+
+    // Single instruction referencing accounts
+    msg.extend_from_slice(&shortvec(1));
+    msg.push(3); // Program index
+    msg.extend_from_slice(&shortvec(2));
+    msg.extend_from_slice(&[0, 1]); // accounts [sender, recipient]
+    msg.extend_from_slice(&shortvec(data.len()));
+    msg.extend_from_slice(&data);
+
+    msg
+}
+
+pub struct VtxMessage {
+    pub header: [u8; 3],
+    pub account_keys: Vec<[u8; 32]>,
+    pub blockhash: [u8; 32],
+    pub instructions: Vec<VtxInstruction>,
+    pub address_table_lookups: Vec<AddressTableLookup>,
+}
+
+pub struct VtxInstruction {
+    pub program_id_index: u8,
+    pub accounts: Vec<u8>,
+    pub data: Vec<u8>,
+}
+
+pub struct AddressTableLookup {
+    pub account_key: [u8; 32],
+    pub writable_indexes: Vec<u8>,
+    pub readonly_indexes: Vec<u8>,
+}
+
+impl VtxMessage {
+    /// Serialize versioned transaction message bytes.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(256);
+        // Prefix for v0 transaction (bit 7 set)
+        msg.push(0x80);
+        msg.extend_from_slice(&self.header);
+
+        // Static account keys length
+        msg.extend_from_slice(&shortvec(self.account_keys.len()));
+        for key in &self.account_keys {
+            msg.extend_from_slice(key);
+        }
+
+        msg.extend_from_slice(&self.blockhash);
+
+        // Instructions count and array
+        msg.extend_from_slice(&shortvec(self.instructions.len()));
+        for ix in &self.instructions {
+            msg.push(ix.program_id_index);
+            msg.extend_from_slice(&shortvec(ix.accounts.len()));
+            msg.extend_from_slice(&ix.accounts);
+            msg.extend_from_slice(&shortvec(ix.data.len()));
+            msg.extend_from_slice(&ix.data);
+        }
+
+        // Address table lookups
+        msg.extend_from_slice(&shortvec(self.address_table_lookups.len()));
+        for lookup in &self.address_table_lookups {
+            msg.extend_from_slice(&lookup.account_key);
+            msg.extend_from_slice(&shortvec(lookup.writable_indexes.len()));
+            msg.extend_from_slice(&lookup.writable_indexes);
+            msg.extend_from_slice(&shortvec(lookup.readonly_indexes.len()));
+            msg.extend_from_slice(&lookup.readonly_indexes);
+        }
+
+        msg
     }
 }
 
@@ -116,11 +242,19 @@ pub fn compile_message(
     }
 
     let num_required_signatures = merged.iter().filter(|m| m.is_signer).count();
-    let num_readonly_signed = merged.iter().filter(|m| m.is_signer && !m.is_writable).count();
-    let num_readonly_unsigned = merged.iter().filter(|m| !m.is_signer && !m.is_writable).count();
+    let num_readonly_signed = merged
+        .iter()
+        .filter(|m| m.is_signer && !m.is_writable)
+        .count();
+    let num_readonly_unsigned = merged
+        .iter()
+        .filter(|m| !m.is_signer && !m.is_writable)
+        .count();
 
     if num_required_signatures > u8::MAX as usize {
-        return Err(format!("{num_required_signatures} signers exceeds the message limit"));
+        return Err(format!(
+            "{num_required_signatures} signers exceeds the message limit"
+        ));
     }
 
     let index_of = |pubkey: &[u8; 32]| -> Result<u8, String> {
@@ -131,25 +265,34 @@ pub fn compile_message(
             .ok_or_else(|| "account missing from the compiled table".to_string())
     };
 
-    let mut msg = Vec::with_capacity(3 + merged.len() * 32 + 32 + 128);
-    msg.push(num_required_signatures as u8);
-    msg.push(num_readonly_signed as u8);
-    msg.push(num_readonly_unsigned as u8);
+    let header = [
+        num_required_signatures as u8,
+        num_readonly_signed as u8,
+        num_readonly_unsigned as u8,
+    ];
 
-    msg.extend_from_slice(&shortvec(merged.len() as u16));
+    let mut msg = Vec::with_capacity(256);
+    // Prefix for v0 transaction (bit 7 set)
+    msg.push(0x80);
+    msg.extend_from_slice(&header);
+
+    // Static account keys length
+    msg.extend_from_slice(&shortvec(merged.len()));
     for meta in &merged {
         msg.extend_from_slice(&meta.pubkey);
     }
+
     msg.extend_from_slice(&blockhash);
 
-    msg.extend_from_slice(&shortvec(instructions.len() as u16));
+    // Instructions count and array
+    msg.extend_from_slice(&shortvec(instructions.len()));
     for ix in instructions {
         msg.push(index_of(&ix.program_id)?);
-        msg.extend_from_slice(&shortvec(ix.accounts.len() as u16));
+        msg.extend_from_slice(&shortvec(ix.accounts.len()));
         for meta in &ix.accounts {
             msg.push(index_of(&meta.pubkey)?);
         }
-        msg.extend_from_slice(&shortvec(ix.data.len() as u16));
+        msg.extend_from_slice(&shortvec(ix.data.len()));
         msg.extend_from_slice(&ix.data);
     }
 
@@ -279,7 +422,11 @@ mod tests {
         let program = key(9);
         let msg = compile_message(
             &payer,
-            &[Instruction { program_id: program, accounts: vec![], data: vec![7] }],
+            &[Instruction {
+                program_id: program,
+                accounts: vec![],
+                data: vec![7],
+            }],
             BLOCKHASH,
         )
         .unwrap();
@@ -294,7 +441,11 @@ mod tests {
 
     #[test]
     fn rejects_a_malformed_blockhash() {
-        let ix = Instruction { program_id: key(9), accounts: vec![], data: vec![0] };
+        let ix = Instruction {
+            program_id: key(9),
+            accounts: vec![],
+            data: vec![0],
+        };
         assert!(compile_message(&key(1), &[ix], "not-base58-!!!").is_err());
     }
 }

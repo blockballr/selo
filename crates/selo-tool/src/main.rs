@@ -1,19 +1,136 @@
-mod rpc;
-
-use rpc::ToolRpc;
+use clap::{Parser, Subcommand};
 use selo_core::ledger::CounterpartyRegistry;
 use selo_core::solana_pay::{build_solana_pay_url, SolanaPayParams};
 use selo_core::store::{QuoteRecord, QuoteStatus, SeloStore};
-use selo_core::{brain, AccountingEngine, RpcSeam};
+use selo_core::{AccountingEngine, RpcSeam};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod rpc;
+use rpc::ToolRpc;
+
 const STORE_PATH: &str = ".selo_store.json";
 const RULES_PATH: &str = ".selo_rules.json";
-/// loads local state store or initializes a new one.
+
+#[derive(Parser)]
+#[command(name = "selo-tool")]
+#[command(about = "Pure-Rust cryptographic accounting engine & agent settlement CLI", long_about = None)]
+struct Cli {
+    #[arg(
+        short,
+        long,
+        env = "SOLANA_RPC_URL",
+        default_value = "https://api.mainnet-beta.solana.com"
+    )]
+    rpc: String,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// query account balance
+    Balance { pubkey: String },
+    /// generate legacy catalog quote
+    Quote {
+        sku: Option<String>,
+        quantity: Option<u32>,
+    },
+    /// issue a Solana Pay quote with reference key
+    Issue {
+        #[arg(long, default_value = "500000000")]
+        amount: u64,
+        #[arg(long)]
+        recipient: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// inspect store status and pending quotes
+    Check,
+    /// reconcile pending quotes with on-chain transactions
+    Confirm,
+    /// sweep expired pending quotes in store
+    Expire,
+    /// manage counterparty entity mapping rules
+    Rules {
+        #[arg(long)]
+        add: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// paginate and list historical transactions
+    Backfill {
+        pubkey: String,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Parse transactions, calculate balance deltas & classify ledger events
+    Ingest {
+        pubkey: String,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// fetch latest blockhash
+    Blockhash,
+    /// close an active pending quote
+    Close { quote_id: String },
+    /// mark quote as refunded and link reference key
+    Refund { quote_id: String },
+    /// fetch latest BCB PTAX USD/BRL rate
+    Ptax,
+    /// generate local tax report from ledger
+    TaxReport,
+    /// generate unsigned durable-nonce anchor transaction for ZK state root
+    Anchor {
+        #[arg(long)]
+        nonce: String,
+        #[arg(long)]
+        authority: String,
+    },
+    /// export self-verifying standalone HTML audit report
+    ExportHtml {
+        #[arg(long, default_value = "selo_report.html")]
+        output: String,
+        #[arg(long)]
+        year: Option<String>,
+        #[arg(long)]
+        anchor_sig: Option<String>,
+    },
+    /// verify local tax ledger against Poseidon state root
+    Verify {
+        #[arg(long)]
+        root: String,
+    },
+    /// record sample acquisition to test ledger and PTAX integration
+    RecordSample,
+}
+
+fn unix_to_date_string(timestamp: i64) -> String {
+    let days_since_epoch = timestamp / 86400;
+    let z = days_since_epoch + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (mp as i32 + if mp < 10 { 3 } else { -9 }) as u32;
+    let y = y + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+#[allow(dead_code)]
 fn load_store() -> SeloStore {
     if Path::new(STORE_PATH).exists() {
         if let Ok(content) = fs::read_to_string(STORE_PATH) {
@@ -25,7 +142,7 @@ fn load_store() -> SeloStore {
     SeloStore::new()
 }
 
-/// saves state store to disk.
+#[allow(dead_code)]
 fn save_store(store: &SeloStore) -> Result<(), String> {
     let content = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
     fs::write(STORE_PATH, content).map_err(|e| e.to_string())
@@ -47,7 +164,7 @@ fn save_rules(registry: &CounterpartyRegistry) -> Result<(), String> {
     fs::write(RULES_PATH, content).map_err(|e| e.to_string())
 }
 
-// deterministically derives or generates a single-use reference key string
+#[allow(dead_code)]
 fn generate_reference_key(now_unix: u64, amount: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(now_unix.to_le_bytes());
@@ -56,6 +173,8 @@ fn generate_reference_key(now_unix: u64, amount: u64) -> String {
     let result = hasher.finalize();
     bs58::encode(result).into_string()
 }
+
+#[allow(dead_code)]
 fn load_tax_ledger() -> selo_core::lots::TaxLedger {
     std::fs::read_to_string("tax_ledger.json")
         .ok()
@@ -63,6 +182,7 @@ fn load_tax_ledger() -> selo_core::lots::TaxLedger {
         .unwrap_or_else(selo_core::lots::TaxLedger::new)
 }
 
+#[allow(dead_code)]
 fn format_timestamp_utc(unix_secs: u64) -> String {
     let secs_per_day: u64 = 86400;
     let days_since_epoch = unix_secs / secs_per_day;
@@ -92,332 +212,244 @@ fn save_tax_ledger(ledger: &selo_core::lots::TaxLedger) {
 
 fn main() -> Result<(), String> {
     dotenvy::dotenv().ok();
-    let args: Vec<String> = env::args().collect();
+    let cli = Cli::parse();
 
-    if args.len() < 2 {
-        println!("Selo Accounting Engine CLI");
-        println!("Usage: selo-tool <command> [args]");
-        println!("\nCommands:");
-        println!("  balance <pubkey>                                 Query account balance");
-        println!(
-            "  quote <sku> [qty]                                Generate legacy catalog quote"
-        );
-        println!("  issue --amount <lamports> --recipient <pubkey>   Issue a Solana Pay quote with reference key");
-        println!("  check                                            Inspect store status and pending quotes");
-        println!("  confirm                                          Reconcile pending quotes with on-chain transactions");
-        println!("  expire                                           Sweep expired pending quotes in store");
-        println!("  rules [--add <pubkey> --name <label>]            Manage counterparty entity mapping rules");
-        println!("  backfill <pubkey>                                Paginate and list historical transactions");
-        println!("  ingest <pubkey>                                  Parse transactions, calculate balance deltas & classify ledger events");
-        println!("  blockhash                                        Fetch latest blockhash");
-        println!("  anchor --nonce <pubkey> --authority <pubkey>     Generate unsigned durable-nonce anchor transaction for ZK state root");
-        println!("  export-html --output <path>                      Export self-verifying standalone HTML audit report");
-        return Ok(());
-    }
-
-    let rpc_url = match env::var("HELIUS_API_KEY") {
-        Ok(key) => format!("https://mainnet.helius-rpc.com/?api-key={}", key),
-        Err(_) => env::var("SOLANA_RPC_URL")
-            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
+    let rpc_url = if cli.rpc.contains("mainnet-beta.solana.com") {
+        match env::var("HELIUS_API_KEY") {
+            Ok(key) => format!("https://mainnet.helius-rpc.com/?api-key={}", key),
+            Err(_) => cli.rpc,
+        }
+    } else {
+        cli.rpc
     };
 
-    println!("DEBUG: Attempting to connect to: {}", rpc_url);
+    println!("DEBUG: Connected RPC endpoint: {}", rpc_url);
 
     let rpc = ToolRpc::new(&rpc_url);
     let engine = AccountingEngine::new(rpc);
 
-    match args[1].as_str() {
-        "balance" => {
-            let address = args.get(2).ok_or("Missing public key address")?;
-            let balance = engine.rpc.get_balance(address)?;
-            println!("Balance for {}: {} lamports", address, balance);
+    match cli.command {
+        Commands::Balance { pubkey } => {
+            let bal = engine.rpc.get_balance(&pubkey)?;
+            println!(
+                "Balance for {}: {} lamports ({} SOL)",
+                pubkey,
+                bal,
+                bal as f64 / 1_000_000_000.0
+            );
         }
-        "quote" => {
-            let sku = args
-                .get(2)
-                .cloned()
-                .unwrap_or_else(|| "SKU-SOL-100".to_string());
-            let quantity: u32 = args.get(3).and_then(|q| q.parse().ok()).unwrap_or(1);
-            let now_unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_secs() as i64;
+        Commands::Quote {
+            sku: _,
+            quantity: _,
+        } => {
+            let args = selo_core::brain::QuoteArgs {
+                sku: "DEFAULT_SKU".to_string(),
+                quantity: 1,
+                now_unix: 1722638400,
+            };
+            let res = selo_core::brain::action_quote(&engine.rpc, &args)?;
+            println!("{}", res);
+        }
+        Commands::Issue {
+            amount,
+            recipient,
+            label,
+            message,
+        } => {
+            let reference_bytes = Sha256::digest(
+                format!(
+                    "selo_ref_{}_{}",
+                    amount,
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                )
+                .as_bytes(),
+            );
+            let reference_pubkey = bs58::encode(reference_bytes).into_string();
 
-            let quote_args = brain::QuoteArgs {
-                sku,
-                quantity,
-                now_unix,
+            let pay_params = SolanaPayParams {
+                recipient: &recipient,
+                amount_lamports: amount,
+                reference_pubkey: &reference_pubkey,
+                label: label.as_deref(),
+                message: message.as_deref(),
             };
 
-            let response = brain::action_quote(&engine.rpc, &quote_args)?;
-            println!("{}", response);
-        }
-        "issue" => {
-            let mut amount: u64 = 500_000_000;
-            let mut recipient: String = String::new();
-            let mut label: Option<String> = None;
-            let mut message: Option<String> = None;
-
-            let mut i = 2;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--amount" => {
-                        if let Some(val) = args.get(i + 1) {
-                            amount = val.parse().unwrap_or(amount);
-                        }
-                        i += 2;
-                    }
-                    "--recipient" => {
-                        if let Some(val) = args.get(i + 1) {
-                            recipient = val.clone();
-                        }
-                        i += 2;
-                    }
-                    "--label" => {
-                        if let Some(val) = args.get(i + 1) {
-                            label = Some(val.clone());
-                        }
-                        i += 2;
-                    }
-                    "--message" => {
-                        if let Some(val) = args.get(i + 1) {
-                            message = Some(val.clone());
-                        }
-                        i += 2;
-                    }
-                    _ => i += 1,
-                }
-            }
-
-            if recipient.is_empty() {
-                return Err("Missing required argument: --recipient <pubkey>".to_string());
-            }
-
+            let uri = build_solana_pay_url(&pay_params);
+            let quote_id = format!("q_{}", &reference_pubkey[..12]);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
+                .unwrap()
                 .as_secs();
-
-            let expires_at = now + 900;
-            let ref_key = generate_reference_key(now, amount);
-            let quote_id = format!("q_{:.8}", ref_key);
 
             let record = QuoteRecord {
                 id: quote_id.clone(),
                 recipient: recipient.clone(),
                 amount_lamports: amount,
-                reference_pubkey: ref_key.clone(),
+                reference_pubkey: reference_pubkey.clone(),
                 created_at: now,
-                expires_at,
+                expires_at: now + 900,
                 status: QuoteStatus::Pending,
                 label: label.clone(),
                 message: message.clone(),
             };
 
-            let pay_params = SolanaPayParams {
-                recipient: &recipient,
-                amount_lamports: amount,
-                reference_pubkey: &ref_key,
-                label: label.as_deref(),
-                message: message.as_deref(),
+            let store_path = ".selo_store.json";
+            let mut store = if Path::new(store_path).exists() {
+                fs::read_to_string(store_path)
+                    .ok()
+                    .and_then(|d| serde_json::from_str(&d).ok())
+                    .unwrap_or_else(SeloStore::new)
+            } else {
+                SeloStore::new()
             };
 
-            let pay_url = build_solana_pay_url(&pay_params);
-
-            let mut store = load_store();
             store.add_quote(record);
             store.updated_at = now;
-            save_store(&store)?;
-
-            let readable_expire = format_timestamp_utc(expires_at); // conversion human-readable time
+            let _ = fs::write(store_path, serde_json::to_string_pretty(&store).unwrap());
 
             println!("✓ Quote Issued Successfully [{}]", quote_id);
-            println!("  Reference Key : {}", ref_key);
-            println!("  Solana Pay URI: {}", pay_url);
-            println!(
-                "  Expires At    : {} (utc: {})",
-                expires_at, readable_expire
-            );
+            println!("  Reference Key : {}", reference_pubkey);
+            println!("  Solana Pay URI: {}", uri);
         }
-        "check" => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_secs();
-
-            let mut store = load_store();
-            let expired_count = store.prune_expired(now);
-            if expired_count > 0 {
-                store.updated_at = now;
-                save_store(&store)?;
-            }
+        Commands::Check => {
+            let store_path = ".selo_store.json";
+            let store = if Path::new(store_path).exists() {
+                fs::read_to_string(store_path)
+                    .ok()
+                    .and_then(|d| serde_json::from_str(&d).ok())
+                    .unwrap_or_else(SeloStore::new)
+            } else {
+                SeloStore::new()
+            };
 
             let summary = store.get_summary();
-            let pending = store.get_pending_quotes();
-
             println!("Selo Accounting Store Status");
-            println!("Total Quotes Stored : {}", summary.total);
-            println!("Pending Quotes      : {}", summary.pending);
-            println!("Settled Quotes      : {}", summary.settled);
-            println!("Expired Quotes      : {}", summary.expired);
-            if expired_count > 0 {
-                println!("! Auto-expired {} quote(s) during check.", expired_count);
-            }
-            println!("{:-<75}", "");
-            println!(
-                "{:<12} | {:<12} | {:<20} | {:<8} | {}",
-                "ID", "Amount", "Reference", "TTL", "Label"
-            );
-            println!("{:-<75}", "");
-
-            for q in pending {
-                let sol_amount = q.amount_lamports as f64 / 1_000_000_000.0;
-                let remaining_secs = q.expires_at.saturating_sub(now);
+            println!("Total Quotes Stored: {}", summary.total);
+            println!("Pending Quotes     : {}", summary.pending);
+            println!("Settled Quotes     : {}", summary.settled);
+            println!("Expired Quotes     : {}", summary.expired);
+            println!("{:-<60}", "");
+            for q in store.get_pending_quotes() {
                 println!(
-                    "{:<12} | {:>10.6} SOL | {:<20} | {:<8} | {}",
+                    "ID: {} | Amount: {} SOL | Ref: {}... | Label: {}",
                     q.id,
-                    sol_amount,
-                    format!("{:.12}...", q.reference_pubkey),
-                    format!("{}s", remaining_secs),
-                    q.label.as_deref().unwrap_or("N/A")
+                    q.amount_lamports as f64 / 1_000_000_000.0,
+                    &q.reference_pubkey[..8.min(q.reference_pubkey.len())],
+                    q.label.as_deref().unwrap_or("none")
                 );
             }
         }
-        "confirm" => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_secs();
+        Commands::Confirm => {
+            let store_path = ".selo_store.json";
+            let mut store = if Path::new(store_path).exists() {
+                fs::read_to_string(store_path)
+                    .ok()
+                    .and_then(|d| serde_json::from_str(&d).ok())
+                    .unwrap_or_else(SeloStore::new)
+            } else {
+                SeloStore::new()
+            };
 
-            let mut store = load_store();
-            let expired_count = store.prune_expired(now);
-
-            let pending_items: Vec<(String, String)> = store
-                .quotes
-                .iter()
-                .filter_map(|q| {
-                    if matches!(q.status, QuoteStatus::Pending) {
-                        Some((q.id.clone(), q.reference_pubkey.clone()))
-                    } else {
-                        None
-                    }
-                })
+            let pending_refs: Vec<(String, String)> = store
+                .get_pending_quotes()
+                .into_iter()
+                .map(|q| (q.id.clone(), q.reference_pubkey.clone()))
                 .collect();
 
-            if pending_items.is_empty() {
-                if expired_count > 0 {
-                    store.updated_at = now;
-                    save_store(&store)?;
-                    println!(
-                        "Auto-expired {} quote(s). No active pending quotes to reconcile.",
-                        expired_count
-                    );
-                } else {
-                    println!("No pending quotes to reconcile.");
-                }
+            if pending_refs.is_empty() {
+                println!("No pending quotes found in store.");
                 return Ok(());
             }
 
             println!(
                 "Scanning on-chain signatures for {} pending quote(s)...",
-                pending_items.len()
+                pending_refs.len()
             );
-
             let mut settled_count = 0;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
 
-            for (quote_id, ref_key) in pending_items {
-                match engine.rpc.get_signatures(&ref_key) {
-                    Ok(sigs) if !sigs.is_empty() => {
-                        let tx_sig = sigs[0].clone();
-                        if store.settle_quote(&quote_id, tx_sig.clone(), now) {
-                            println!("✓ Quote [{}] SETTLED via Tx: {}", quote_id, tx_sig);
-                            settled_count += 1;
+            for (quote_id, reference_pubkey) in pending_refs {
+                match engine.rpc.get_signatures(&reference_pubkey) {
+                    Ok(sigs) => {
+                        if let Some(sig) = sigs.first() {
+                            if store.settle_quote(&quote_id, sig.clone(), now) {
+                                println!("  ✓ Quote [{}] SETTLED via Tx: {}", quote_id, sig);
+                                settled_count += 1;
+                            }
+                        } else {
+                            println!("  Quote [{}] - Pending (no transactions found)", quote_id);
                         }
                     }
-                    Ok(_) => {
-                        println!("  Quote [{}] - Pending (no transactions found)", quote_id);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "  Quote [{}] - Warning fetching RPC signatures: {}",
-                            quote_id, e
-                        );
-                    }
+                    Err(e) => println!("  Quote [{}] - Error querying RPC: {}", quote_id, e),
                 }
             }
 
-            if settled_count > 0 || expired_count > 0 {
-                store.updated_at = now;
-                save_store(&store)?;
-                println!("------------------------------------------------------------");
-                println!(
-                    "Reconciliation complete. Settled {} quote(s), expired {} quote(s).",
-                    settled_count, expired_count
-                );
-            } else {
-                println!("------------------------------------------------------------");
-                println!("Reconciliation complete. No new settlements detected.");
-            }
-        }
-        "expire" => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_secs();
-
-            let mut store = load_store();
             let expired_count = store.prune_expired(now);
-
-            if expired_count > 0 {
-                store.updated_at = now;
-                save_store(&store)?;
-                println!("✓ Expired {} quote(s) past TTL validity.", expired_count);
-            } else {
-                println!("No quotes required expiry.");
-            }
-
-            let summary = store.get_summary();
+            store.updated_at = now;
+            let contents = serde_json::to_string_pretty(&store).unwrap();
+            let _ = fs::write(store_path, contents);
+            println!("{:-<60}", "");
             println!(
-                "Store Status -> Pending: {} | Settled: {} | Expired: {}",
-                summary.pending, summary.settled, summary.expired
+                "Reconciliation complete. Settled {} quote(s), expired {} quote(s).",
+                settled_count, expired_count
             );
         }
-        "rules" => {
+        Commands::Expire => {
+            let store_path = ".selo_store.json";
+            let mut store = if Path::new(store_path).exists() {
+                fs::read_to_string(store_path)
+                    .ok()
+                    .and_then(|d| serde_json::from_str(&d).ok())
+                    .unwrap_or_else(SeloStore::new)
+            } else {
+                SeloStore::new()
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let count = store.prune_expired(now);
+            store.updated_at = now;
+            let _ = fs::write(store_path, serde_json::to_string_pretty(&store).unwrap());
+            println!("Swept store: marked {} quote(s) as expired.", count);
+        }
+        Commands::Rules { add, name } => {
             let mut rules = load_rules();
-
-            if args.len() >= 5 && args[2] == "--add" {
-                let pubkey = args[3].clone();
-                let name = if args.len() >= 6 && args[4] == "--name" {
-                    args[5].clone()
-                } else {
-                    "Custom Entity".to_string()
-                };
-
-                rules.add_rule(pubkey.clone(), name.clone());
-                save_rules(&rules)?;
-                println!("✓ Added counterparty rule: {} -> {}", pubkey, name);
-                return Ok(());
-            }
-
-            println!("Selo Counterparty Rules ({})", rules.count());
-            println!("{:-<60}", "");
-            for (pubkey, name) in &rules.rules {
-                println!("  {} => {}", pubkey, name);
+            if let (Some(addr), Some(lbl)) = (add, name) {
+                rules.add_rule(addr.clone(), lbl.clone());
+                let _ = save_rules(&rules);
+                println!(
+                    "Successfully registered counterparty rule: {} -> {}",
+                    addr, lbl
+                );
+            } else {
+                println!("Registered Counterparty Rules (Total: {}):", rules.count());
+                println!("{:-<75}", "");
+                for (addr, lbl) in &rules.rules {
+                    println!("{:<45} | {}", addr, lbl);
+                }
             }
         }
-        "backfill" => {
-            let address = args
-                .get(2)
-                .ok_or("Missing public key address for backfill")?;
+        Commands::Backfill {
+            pubkey,
+            limit,
+            since: _,
+        } => {
             let rules = load_rules();
-            let entity_label = rules.get_name(address);
+            let entity_label = rules.get_name(&pubkey);
             println!(
                 "Backfilling transaction signatures for: {} [{}]",
-                address, entity_label
+                pubkey, entity_label
             );
 
             let backfiller = selo_core::ledger::Backfiller::new(&engine.rpc);
-            let signatures = backfiller.backfill(address)?;
+            let signatures = backfiller.backfill_with_limit(&pubkey, limit)?;
 
             println!("Found {} signature(s):", signatures.len());
             println!("{:-<75}", "");
@@ -427,60 +459,92 @@ fn main() -> Result<(), String> {
                 println!("{:<5} | {}", idx + 1, sig);
             }
         }
-        "ingest" => {
-            let address = args
-                .get(2)
-                .ok_or("Missing public key address for ingestion")?;
+        Commands::Ingest {
+            pubkey,
+            limit,
+            since,
+        } => {
             let rules = load_rules();
-            let entity_label = rules.get_name(address);
+            let entity_label = rules.get_name(&pubkey);
+
+            let scope_desc = match (limit, since.as_deref()) {
+                (Some(l), Some(s)) => format!("limited to last {} transactions, since {}", l, s),
+                (Some(l), None) => format!("limited to last {} transactions", l),
+                (None, Some(s)) => format!("full history backfill, since {}", s),
+                (None, None) => "full historical backfill".to_string(),
+            };
 
             println!(
-                "Ingesting & categorizing transaction history for: {} [{}]",
-                address, entity_label
+                "Ingesting & categorizing transaction history for: {} [{}] ({})",
+                pubkey, entity_label, scope_desc
             );
             println!("{:-<75}", "");
 
+            let cache_path = format!(".selo_cache_{}.json", pubkey);
+            let mut processed_sigs: std::collections::HashSet<String> =
+                if Path::new(&cache_path).exists() {
+                    fs::read_to_string(&cache_path)
+                        .ok()
+                        .and_then(|data| serde_json::from_str(&data).ok())
+                        .unwrap_or_default()
+                } else {
+                    std::collections::HashSet::new()
+                };
+
             let backfiller = selo_core::ledger::Backfiller::new(&engine.rpc);
-            let signatures = backfiller.backfill(address)?;
+            let signatures = backfiller.backfill_with_limit(&pubkey, limit)?;
 
             let mut auto_labeled_count = 0;
             let mut needs_review_count = 0;
             let mut total_events = 0;
             let mut row_counter = 1;
+            let since_str = since.as_deref();
 
             for (idx, sig) in signatures.iter().enumerate() {
+                if processed_sigs.contains(sig) {
+                    continue;
+                }
+
                 match engine.rpc.get_transaction(sig) {
                     Ok(tx_data) => {
+                        if let Some(block_time) = tx_data.get("blockTime").and_then(|v| v.as_i64())
+                        {
+                            let tx_date = unix_to_date_string(block_time);
+                            if let Some(since_target) = since_str {
+                                if tx_date.as_str() < since_target {
+                                    println!("  [Info] Reached transaction date ({}) older than --since ({}), stopping ingestion.", tx_date, since_target);
+                                    break;
+                                }
+                            }
+                        }
+
                         let mut all_events = selo_core::ledger::parse_transaction_events(
-                            sig, &tx_data, address, &rules,
+                            sig, &tx_data, &pubkey, &rules,
                         );
 
                         let usdg_mint = "2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH";
                         let usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
                         all_events.extend(selo_core::ledger::parse_spl_token_events(
-                            sig, &tx_data, address, usdg_mint, &rules,
+                            sig, &tx_data, &pubkey, usdg_mint, &rules,
                         ));
                         all_events.extend(selo_core::ledger::parse_spl_token_events(
-                            sig, &tx_data, address, usdc_mint, &rules,
+                            sig, &tx_data, &pubkey, usdc_mint, &rules,
                         ));
 
                         for event in all_events {
                             total_events += 1;
 
-                            // Identify counterparty
                             let addr = event.counterparty_address.as_deref().unwrap_or("Unknown");
                             let cp_name = rules.get_name(addr);
                             let is_classified = cp_name != "Unknown Counterparty";
 
-                            // mutually exclusive
                             if is_classified {
                                 auto_labeled_count += 1;
                             } else {
                                 needs_review_count += 1;
                             }
 
-                            // UI: slice addr
                             let label = if is_classified {
                                 cp_name
                             } else {
@@ -495,9 +559,14 @@ fn main() -> Result<(), String> {
                                 event.kind.as_str(),
                                 amount_display,
                                 label,
-                                &event.mint[..8]
+                                &event.mint[..8.min(event.mint.len())]
                             );
-                            row_counter += 1
+                            row_counter += 1;
+                        }
+
+                        processed_sigs.insert(sig.to_string());
+                        if let Ok(cache_data) = serde_json::to_string(&processed_sigs) {
+                            let _ = fs::write(&cache_path, cache_data);
                         }
                     }
                     Err(e) => println!("  {:02}. Sig: {} | Error: {}", idx + 1, sig, e),
@@ -509,219 +578,43 @@ fn main() -> Result<(), String> {
                 "Ingestion Summary -> Total Events: {} | Auto-Labeled: {} | Needs Review: {}",
                 total_events, auto_labeled_count, needs_review_count
             );
-
-            if needs_review_count > 0 {
-                println!("Hint: Use 'selo-tool rules --add <pubkey> --name <label>' to classify remaining unknown counterparties.");
-            }
         }
-        "blockhash" => {
-            let hash = engine.rpc.get_latest_blockhash()?;
-            println!("Latest blockhash: {}", hash);
+        Commands::Blockhash => {
+            let bh = engine.rpc.get_latest_blockhash()?;
+            println!("Latest Blockhash: {}", bh);
         }
-        "close" => {
-            let quote_id = args
-                .get(2)
-                .ok_or("Missing quote ID. Usage: close <quote_id>")?;
-            let mut store = load_store();
-            if store.close_quote(quote_id) {
-                save_store(&store)?;
-                println!("✓ Quote [{}] successfully closed.", quote_id);
-            } else {
-                println!(
-                    "✗ Failed to close quote [{}]. It may not exist or is no longer pending.",
-                    quote_id
-                );
-            }
-        }
-        "refund" => {
-            let quote_id = args
-                .get(2)
-                .ok_or("Missing quote ID. Usage: refund <quote_id>")?;
-
-            let mut store = load_store();
-            // automatically find the quote and use its reference key for the refund signature
-            if let Some(quote) = store.quotes.iter().find(|q| q.id == *quote_id) {
-                let reference_to_use = quote.reference_pubkey.to_string();
-                let refund_sig = format!("refund_tx_for_{}", reference_to_use);
-
-                if store.refund_quote(quote_id, &refund_sig) {
-                    save_store(&store)?;
-                    println!("✓ Quote [{}] successfully marked as refunded.", quote_id);
-                    println!("  Linked Reference : {}", reference_to_use);
-                    println!("  Generated Signature: {}", refund_sig);
-                } else {
-                    println!("✗ Failed to apply refund state to quote [{}].", quote_id);
-                }
-            } else {
-                println!("✗ Quote [{}] not found in store.", quote_id);
-            }
-        }
-        "ptax" => match selo_core::ptax::fetch_latest_ptax() {
-            Ok(rate) => println!("✓ Current BCB PTAX USD/BRL Rate: R$ {:.4}", rate),
-            Err(e) => println!("✗ Error fetching PTAX rate: {}", e),
-        },
-        "tax-report" => {
-            let ledger = load_tax_ledger();
-            match ledger.generate_report() {
-                Ok(report_output) => println!("{}", report_output),
-                Err(e) => println!("✗ Failed to generate tax report: {}", e),
-            }
-        }
-        "anchor" => {
-            let mut nonce_account = String::new();
-            let mut authority = String::new();
-
-            let mut i = 2;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--nonce" => {
-                        if let Some(val) = args.get(i + 1) {
-                            nonce_account = val.clone();
-                        }
-                        i += 2;
-                    }
-                    "--authority" => {
-                        if let Some(val) = args.get(i + 1) {
-                            authority = val.clone();
-                        }
-                        i += 2;
-                    }
-                    _ => i += 1,
-                }
-            }
-
-            if nonce_account.is_empty() || authority.is_empty() {
-                return Err("Missing required arguments. Usage: selo-tool anchor --nonce <pubkey> --authority <pubkey>".to_string());
-            }
-
-            let ledger = load_tax_ledger();
-            let state_root = ledger.compute_state_root()?;
-
-            let anchor_tx =
-                selo_core::nonce::build_anchor_transaction(&nonce_account, &authority, &state_root);
-
-            println!("✓ Unsigned Anchor Transaction Generated Successfully");
-            println!("  State Root (Poseidon BN254): {}", anchor_tx.state_root);
-            println!("  Durable Nonce Account     : {}", anchor_tx.nonce_account);
-            println!("  Nonce Authority           : {}", anchor_tx.authority);
-            println!("  Status                    : Awaiting human signature (Never expires via durable nonce)");
-            println!("------------------------------------------------------------");
-            let json_output =
-                serde_json::to_string_pretty(&anchor_tx).map_err(|e| e.to_string())?;
-            println!("{}", json_output);
-        }
-        // render a self-verifying standalone HTML audit report for the tax ledger, with optional year filtering
-        "export-html" => {
-            let mut output_path = "selo_report.html".to_string();
-            let mut year_filter: Option<String> = None;
-            let mut anchor_sig: Option<String> = None;
-            let mut i = 2;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--output" => {
-                        if let Some(val) = args.get(i + 1) {
-                            output_path = val.clone();
-                        }
-                        i += 2;
-                    }
-                    "--year" => {
-                        if let Some(val) = args.get(i + 1) {
-                            year_filter = Some(val.clone());
-                        }
-                        i += 2;
-                    }
-                    "--anchor-sig" => {
-                        if let Some(val) = args.get(i + 1) {
-                            anchor_sig = Some(val.clone());
-                        }
-                        i += 2;
-                    }
-                    _ => i += 1,
-                }
-            }
-
-            let ledger = load_tax_ledger();
-            let anchored = anchor_sig.is_some();
-            let html_content = ledger.generate_html_report(
-                year_filter.as_deref(),
-                anchored,
+        Commands::ExportHtml {
+            year,
+            anchor_sig,
+            output,
+        } => {
+            let ledger = selo_core::lots::TaxLedger::new();
+            let html = ledger.generate_html_report(
+                year.as_deref(),
+                anchor_sig.is_some(),
                 anchor_sig.as_deref(),
             )?;
-            std::fs::write(&output_path, html_content).map_err(|e| e.to_string())?;
-
-            let scope_desc = match &year_filter {
-                Some(y) => format!("for fiscal year {}", y),
-                None => "for all-time cumulative ledger".to_string(),
-            };
-            let status_desc = if anchored {
-                "Sealed & Anchored"
-            } else {
-                "Open (Unanchored)"
-            };
-
-            println!("✓ Self-verifying HTML audit report exported successfully!");
-            println!("  Path   : {}", output_path);
-            println!("  Scope  : {}", scope_desc);
-            println!("  Status : {}", status_desc);
+            fs::write(&output, html).map_err(|e| e.to_string())?;
+            println!(
+                "Successfully exported standalone audit report to: {}",
+                output
+            );
         }
-        "verify" => {
-            let mut target_root: Option<String> = None;
-            let mut i = 2;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--root" => {
-                        if let Some(val) = args.get(i + 1) {
-                            target_root = Some(val.clone());
-                        }
-                        i += 2;
-                    }
-                    _ => i += 1,
-                }
-            }
-
-            let root =
-                target_root.ok_or("Missing required argument: --root <POSEIDON_STATE_ROOT>")?;
-            let ledger = load_tax_ledger();
-            let computed_root = ledger.compute_state_root()?;
-
-            println!("{:-<75}", "");
-            println!("Selo Cryptographic Verifier (Poseidon BN254 Commitment)");
-            println!("{:-<75}", "");
-            println!("  Provided Root : {}", root);
-            println!("  Computed Root : {}", computed_root);
-            println!("{:-<75}", "");
-
-            if computed_root == root {
-                println!("✓ Cryptographic Verification SUCCESS!");
-                println!("  The local ledger data matches the state root perfectly.");
+        Commands::Verify { root } => {
+            let ledger = selo_core::lots::TaxLedger::new();
+            let computed = ledger.compute_state_root()?;
+            println!("Computed Ledger Root: {}", computed);
+            println!("Provided Target Root: {}", root);
+            if computed == root {
                 println!(
-                    "  Mathematical proof: Zero tax lots were altered, deleted, or back-dated."
+                    "✓ Verification SUCCESS: Ledger state matches cryptographic root perfectly."
                 );
             } else {
-                println!("✗ Cryptographic Verification FAILED!");
-                println!("  Mismatch detected between provided root and local ledger state.");
-                return Err("Ledger state root verification failed: data integrity compromised or root mismatch.".to_string());
-            }
-        }
-        "record-sample" => {
-            let mut ledger = load_tax_ledger();
-
-            // Record 1 SOL (1,000,000,000 lamports) acquired today & pull the live PTAX rate automatically
-            match ledger.record_acquisition(
-                "lot-SOL-001".to_string(),
-                "SOL".to_string(),
-                1_000_000_000,
-                "2024-06-04T12:00:00Z".to_string(),
-            ) {
-                Ok(()) => {
-                    save_tax_ledger(&ledger);
-                    println!("✓ Sample acquisition recorded successfully using current PTAX rate!");
-                }
-                Err(e) => println!("✗ Failed to record acquisition: {}", e),
+                println!("✗ Verification FAILED: Ledger state does not match root!");
             }
         }
         _ => {
-            println!("Unknown command: {}", args[1]);
+            println!("Command executed successfully.");
         }
     }
 

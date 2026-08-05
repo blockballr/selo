@@ -2,7 +2,7 @@
 name = "selo-tool"
 version.workspace = true
 edition.workspace = true
-description = "ZeroClaw tool plugin for daybook: quote catalog items, confirm on-chain payment, and close the day."
+description = "Zeroclaw deterministic command-line tool for performing accounting work"
 
 [[bin]]
 name = "selo-tool"
@@ -16,3 +16,4 @@ ureq = { version = "3.0", features = ["json"] }
 sha2 = "0.10"
 bs58 = "0.5"
 dotenvy = "0.15"
+clap = { version = "4.4", features = ["derive", "env"] }
