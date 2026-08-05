@@ -71,7 +71,6 @@ cargo test --workspace
 
 ### 2. Payment Intent & Reconciliation
 
-
 ```powershell
 # Issue a payment intent:
 cargo run -p selo-tool -- issue --amount 500000000 --recipient <PUBKEY> --label "Invoice #001"

@@ -2,8 +2,10 @@
 *.html
 !index.html
 .env
+*.json
 .selo_store.json
 .selo_rules.json
+.selo_ledger.json
 /dist
 Cargo.lock.bak
 Cargo.lock

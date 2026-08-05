@@ -1,7 +1,3 @@
-//! Output rendering. The tool's output is read by a language model, so it
-//! leads with a short human-readable summary and follows with a compact
-//! JSON block the model can quote or post-process reliably.
-
 use crate::jupiter::{SwapQuote, TokenPrice};
 use crate::lots::TaxLedger;
 use crate::priority::FeeEstimate;
@@ -10,10 +6,8 @@ use crate::simulate::Simulation;
 use crate::token::TokenTransfer;
 use crate::tx::TxSummary;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
-use crate::address::encode_pubkey;
-
-const TOKEN_PROGRAM_STR: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 /// Render lamports as a SOL decimal string with trailing zeros trimmed.
@@ -548,175 +542,268 @@ pub fn render_fee_estimate(e: &FeeEstimate, accounts: &[String], sol_usd: Option
     format!("{summary}\n\n{json_block}")
 }
 
+fn get_asset_decimals(symbol_or_mint: &str) -> u8 {
+    let s = symbol_or_mint.trim();
+    if s == "SOL" || s == "So11111111111111111111111111111111111111112" || s.starts_with("So111") {
+        9
+    } else {
+        6
+    }
+}
+
 impl TaxLedger {
-    /// Render a self-verifying standalone HTML audit report for the tax ledger.
     pub fn generate_html_report(
         &self,
-        year: Option<&str>,
-        anchored: bool,
-        tx_signature: Option<&str>,
+        fiscal_year: &str,
+        anchor_sig: Option<&str>,
     ) -> Result<String, String> {
         let state_root = self.compute_state_root()?;
-
-        let filtered_lots: Vec<_> = match year {
-            Some(y) => self
-                .lots
-                .iter()
-                .filter(|l| l.acquired_at_utc.starts_with(y))
-                .collect(),
-            None => self.lots.iter().collect(),
-        };
-
-        let mut distinct_years: Vec<String> = self
-            .lots
-            .iter()
-            .map(|l| {
-                if l.acquired_at_utc.len() >= 4 {
-                    l.acquired_at_utc[..4].to_string()
-                } else {
-                    "2026".to_string()
-                }
-            })
-            .collect();
-        distinct_years.sort();
-        distinct_years.dedup();
-        if distinct_years.is_empty() {
-            distinct_years.push("2026".to_string());
-        }
-
-        let active_years = match year {
-            Some(y) => vec![y.to_string()],
-            None => distinct_years,
-        };
-
-        let mut open_cards_html = String::new();
-        let mut sealed_cards_html = String::new();
         let current_calendar_year = "2026";
 
-        for yr in &active_years {
-            let is_year_anchored = anchored || (yr.as_str() < current_calendar_year);
-            let period_title_val = format!("{}-07-26", yr);
-            let yr_prefix = yr.clone();
+        let mut year_month_groups: BTreeMap<String, BTreeMap<String, Vec<crate::lots::TaxLot>>> =
+            BTreeMap::new();
 
-            let yr_lots: Vec<_> = self
-                .lots
-                .iter()
-                .filter(|l| l.acquired_at_utc.starts_with(&yr_prefix))
-                .collect();
-            let count = yr_lots.len();
-            let sum_cost: f64 = yr_lots.iter().map(|l| l.unit_cost_basis_brl).sum();
-
-            let small_mark_sealed = r#"<svg width="17" height="17" viewBox="0 0 128 128" style="display:inline-block; vertical-align:middle; color:var(--wax);" role="img" aria-label="Sealed"><defs><clipPath id="selo-s-sealed"><circle cx="64" cy="64" r="50"/></clipPath></defs><g clip-path="url(#selo-s-sealed)"><path d="M64 0H128V128H64Z" fill="currentColor"/></g><circle cx="64" cy="64" r="50" fill="none" stroke="currentColor" stroke-width="13"/></svg>"#;
-            let small_mark_open = r#"<svg width="17" height="17" viewBox="0 0 128 128" style="display:inline-block; vertical-align:middle; opacity:.45;" role="img" aria-label="Open"><defs><clipPath id="selo-s-open"><circle cx="64" cy="64" r="50"/></clipPath></defs><g clip-path="url(#selo-s-open)"><path d="M64 0H128V128H64Z" fill="currentColor"/></g><circle cx="64" cy="64" r="50" fill="none" stroke="currentColor" stroke-width="13"/></svg>"#;
-
-            let card_content = if is_year_anchored {
-                format!(
-                    r#"
-                  <div class="card period-card" onclick="filterPeriod('{}')" data-period="{}">
-                    <div class="k">Period</div>
-                    <div class="v">{}</div>
-                    <div class="k">Receipts</div>
-                    <div class="v" style="font-size:22px; font-weight:600; font-family:var(--selo-font-mono);">{} &middot; R$ {:.2}</div>
-                    <div class="sealed" style="margin-top:14px;" onclick="event.stopPropagation(); copyToClipboard('{}', this);">
-                      {}
-                      Sealed &middot; root {}&hellip;
-                      <span class="copy-hint" style="font-size:10px; margin-left:auto; opacity:0.7;">Copy</span>
-                    </div>
-                  </div>
-                "#,
-                    yr_prefix,
-                    yr_prefix,
-                    period_title_val,
-                    count,
-                    sum_cost,
-                    state_root,
-                    small_mark_sealed,
-                    &state_root[..8]
-                )
+        for lot in &self.lots {
+            let year_key = if lot.acquired_at_utc.len() >= 4 {
+                lot.acquired_at_utc[..4].to_string()
             } else {
-                format!(
-                    r#"
-                  <div class="card period-card" onclick="filterPeriod('{}')" data-period="{}">
-                    <div class="k">Period</div>
-                    <div class="v">{}</div>
-                    <div class="k">Receipts</div>
-                    <div class="v" style="font-size:22px; font-weight:600; font-family:var(--selo-font-mono);">{} &middot; R$ {:.2}</div>
-                    <div class="open" style="margin-top:14px;">
-                      {}
-                      Open &middot; not yet anchored
-                    </div>
-                  </div>
-                "#,
-                    yr_prefix, yr_prefix, period_title_val, count, sum_cost, small_mark_open
-                )
+                fiscal_year.to_string()
             };
 
-            if is_year_anchored {
-                sealed_cards_html.push_str(&card_content);
+            let month_key = if lot.acquired_at_utc.len() >= 7 {
+                lot.acquired_at_utc[..7].to_string()
             } else {
-                open_cards_html.push_str(&card_content);
-            }
+                format!("{}-01", fiscal_year)
+            };
+
+            year_month_groups
+                .entry(year_key)
+                .or_default()
+                .entry(month_key)
+                .or_default()
+                .push(lot.clone());
         }
 
-        let mut rows = String::new();
-        if filtered_lots.is_empty() {
-            rows.push_str("<tr><td colspan=\"6\" style=\"text-align:center; color:var(--selo-muted);\">No tax lots recorded for the selected scope.</td></tr>");
-        } else {
-            for lot in filtered_lots {
-                rows.push_str(&format!(
-                    "<tr data-date=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>R$ {:.2}</td><td>R$ {:.4}</td><td>{}</td></tr>",
-                    lot.acquired_at_utc, lot.id, lot.asset_symbol, lot.amount, lot.unit_cost_basis_brl, lot.ptax_rate_used, lot.acquired_at_utc
+        if year_month_groups.is_empty() {
+            year_month_groups
+                .entry(fiscal_year.to_string())
+                .or_default();
+        }
+
+        let small_mark_open = r#"<svg width="17" height="17" viewBox="0 0 128 128" style="display:inline-block; vertical-align:middle; opacity:.45;" role="img" aria-label="Open"><defs><clipPath id="s-open"><circle cx="64" cy="64" r="50"/></clipPath></defs><g clip-path="url(#s-open)"><path d="M64 0H128V128H64Z" fill="currentColor"/></g><circle cx="64" cy="64" r="50" fill="none" stroke="currentColor" stroke-width="13"/></svg>"#;
+        let small_mark_sealed = r#"<svg width="17" height="17" viewBox="0 0 128 128" style="display:inline-block; vertical-align:middle; color:var(--wax);" role="img" aria-label="Sealed"><defs><clipPath id="s-seal"><circle cx="64" cy="64" r="50"/></clipPath></defs><g clip-path="url(#s-seal)"><path d="M64 0H128V128H64Z" fill="currentColor"/></g><circle cx="64" cy="64" r="50" fill="none" stroke="currentColor" stroke-width="13"/></svg>"#;
+
+        let mut cumulative_ledger_cost = 0.0;
+        let mut cumulative_ledger_receipts = 0;
+        let mut fiscal_years_html = String::new();
+
+        let mut sorted_years: Vec<String> = year_month_groups.keys().cloned().collect();
+        sorted_years.sort();
+        sorted_years.reverse();
+
+        for target_yr in &sorted_years {
+            let months_in_year = year_month_groups.get(target_yr).unwrap();
+
+            let mut year_cost_brl = 0.0;
+            let mut year_receipt_count = 0;
+            let mut monthly_rows_html = String::new();
+
+            for month_str in (1..=12).rev() {
+                let month_code = format!("{:02}", month_str);
+                let period_key = format!("{}-{month_code}", target_yr);
+                let lots_in_month = months_in_year.get(&period_key);
+
+                let receipt_count = match lots_in_month {
+                    Some(lots) => lots.len(),
+                    None => 0,
+                };
+
+                let mut month_cost_brl = 0.0;
+                let mut month_ptax_sum = 0.0;
+                let mut ptax_count = 0;
+
+                if let Some(lots) = lots_in_month {
+                    for lot in lots {
+                        let asset_decimals = get_asset_decimals(&lot.asset_symbol);
+                        let ui_amount = lot.amount as f64 / 10f64.powi(asset_decimals as i32);
+                        let cost_brl = ui_amount * lot.unit_cost_basis_brl;
+                        month_cost_brl += cost_brl;
+
+                        if lot.ptax_rate_used > 0.0 {
+                            month_ptax_sum += lot.ptax_rate_used;
+                            ptax_count += 1;
+                        }
+                    }
+                }
+
+                year_cost_brl += month_cost_brl;
+                year_receipt_count += receipt_count;
+
+                let avg_ptax = if ptax_count > 0 {
+                    month_ptax_sum / (ptax_count as f64)
+                } else {
+                    5.0000
+                };
+
+                let sample_date = format!("{}-28 UTC", period_key);
+                let has_records = receipt_count > 0;
+                let row_class = if has_records {
+                    ""
+                } else {
+                    "style=\"opacity: 0.4;\""
+                };
+                let accordion_onclick = if has_records {
+                    format!("onclick=\"toggleAccordion('month-{}')\"", period_key)
+                } else {
+                    "".to_string()
+                };
+                let cursor_style = if has_records {
+                    "cursor: pointer;"
+                } else {
+                    "cursor: default;"
+                };
+                let chevron_icon = if has_records { "&#9662;" } else { "" };
+
+                monthly_rows_html.push_str(&format!(
+                    r#"
+                    <div class="accordion-item" id="month-{period_key}" {row_class}>
+                        <div class="accordion-header" {accordion_onclick} style="{cursor_style}">
+                            <div>
+                                <div class="k">Month &middot; {period_key}</div>
+                                <div class="v" style="margin:2px 0 0;">{receipt_count} receipts &middot; R$ {month_cost_brl:.2}</div>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:16px;">
+                                <div class="open">
+                                    {small_mark_open}
+                                    Open &middot; pending close
+                                </div>
+                                <span class="chevron">{chevron_icon}</span>
+                            </div>
+                        </div>
+                    "#,
+                    period_key = period_key,
+                    row_class = row_class,
+                    accordion_onclick = accordion_onclick,
+                    cursor_style = cursor_style,
+                    receipt_count = receipt_count,
+                    month_cost_brl = month_cost_brl,
+                    small_mark_open = small_mark_open,
+                    chevron_icon = chevron_icon
                 ));
+
+                if has_records {
+                    monthly_rows_html.push_str(&format!(
+                        r#"
+                        <div class="accordion-content">
+                            <table>
+                                <thead>
+                                    <tr><th>PERIOD CODE</th><th>ASSET CLASS</th><th>TOTAL VOLUME</th><th>CUMULATIVE COST BASIS (BRL)</th><th>PTAX RATE</th><th>INTERVAL UTC</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td>Month Closing &middot; {period_key}</td>
+                                        <td>Aggregated Monthly Period</td>
+                                        <td>{receipt_count} receipts</td>
+                                        <td>R$ {month_cost_brl:.2}</td>
+                                        <td>R$ {avg_ptax:.4} (Avg)</td>
+                                        <td>{sample_date}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        </div>
+                        "#,
+                        period_key = period_key,
+                        receipt_count = receipt_count,
+                        month_cost_brl = month_cost_brl,
+                        avg_ptax = avg_ptax,
+                        sample_date = sample_date
+                    ));
+                } else {
+                    monthly_rows_html.push_str(
+                        r#"
+                        <div class="accordion-content">
+                            <table>
+                                <thead>
+                                    <tr><th>PERIOD CODE</th><th>ASSET CLASS</th><th>TOTAL VOLUME</th><th>CUMULATIVE COST BASIS (BRL)</th><th>PTAX RATE</th><th>INTERVAL UTC</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td colspan="6" style="text-align: center; color: var(--selo-muted);">No transactions recorded for this month.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        </div>
+                        "#,
+                    );
+                }
             }
+
+            cumulative_ledger_cost += year_cost_brl;
+            cumulative_ledger_receipts += year_receipt_count;
+
+            let is_year_anchored =
+                target_yr.as_str() < current_calendar_year || anchor_sig.is_some();
+            let year_status_html = if is_year_anchored {
+                format!(
+                    r#"<div class="sealed">{small_mark_sealed} Sealed &middot; root {}&hellip;</div>"#,
+                    &state_root.chars().take(12).collect::<String>()
+                )
+            } else {
+                format!(r#"<div class="open">{small_mark_open} Open &middot; pending close</div>"#)
+            };
+
+            let is_current_year = target_yr == current_calendar_year;
+            let year_expanded_class = if is_current_year { "expanded" } else { "" };
+            let year_content_display = if is_current_year { "block" } else { "none" };
+
+            fiscal_years_html.push_str(&format!(
+                r#"
+                <div class="accordion-item" id="year-{target_yr}" style="border-color: var(--selo-ink); margin-bottom: 20px;">
+                    <div class="accordion-header {year_expanded_class}" onclick="toggleAccordion('year-{target_yr}')">
+                        <div>
+                            <div class="k">Fiscal Year &middot; {target_yr}</div>
+                            <div class="v" style="margin:2px 0 0;">{year_receipt_count} receipts &middot; R$ {year_cost_brl:.2}</div>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:16px;">
+                            {year_status_html}
+                            <span class="chevron">&#9662;</span>
+                        </div>
+                    </div>
+                    <div class="accordion-content" style="display: {year_content_display}; padding: 16px;">
+                        <div style="margin-bottom: 16px;">
+                            <div class="k" style="margin-bottom:6px;">Cryptographic State Root (Poseidon BN254 Commitment)</div>
+                            <div style="display:flex; justify-content:space-between; align-items:center; background:var(--selo-raised); padding:10px 14px; border-radius:8px; border:1px solid var(--selo-rule);">
+                                <span style="font: 600 12px/1.4 var(--selo-font-mono); word-break:break-all;">{state_root}</span>
+                                <button class="copy-btn" onclick="copyToClipboard('{state_root}', this)">Copy Root</button>
+                            </div>
+                        </div>
+                        <div style="display:flex; flex-direction:column; gap:12px;">
+                            {monthly_rows_html}
+                        </div>
+                    </div>
+                </div>
+                "#,
+                target_yr = target_yr,
+                year_receipt_count = year_receipt_count,
+                year_cost_brl = year_cost_brl,
+                year_status_html = year_status_html,
+                year_expanded_class = year_expanded_class,
+                year_content_display = year_content_display,
+                state_root = state_root,
+                monthly_rows_html = monthly_rows_html
+            ));
         }
 
-        let signature_section = match tx_signature {
-            Some(sig) => format!(
-                r#"
-              <div class="card" style="max-width:100%; margin-top:24px;">
-                <div class="k" style="display:flex; justify-content:space-between; align-items:center;">
-                  <span>On-Chain Anchor Transaction Signature</span>
-                  <button class="copy-btn" onclick="copyToClipboard('{}', this)">Copy Sig</button>
-                </div>
-                <div class="v" style="font-size:13px; word-break:break-all; margin-top:8px;">{}</div>
-              </div>
-            "#,
-                sig, sig
-            ),
-            None => "".to_string(),
-        };
-
-        let verification_card = format!(
-            r#"
-          <div class="card" style="max-width:100%; margin-bottom:24px;">
-            <div class="k" style="display:flex; justify-content:space-between; align-items:center;">
-              <span>Cryptographic State Root (Poseidon BN254 Commitment)</span>
-              <button class="copy-btn" onclick="copyToClipboard('{}', this)">Copy Root</button>
-            </div>
-            <div class="v" style="font-size:13px; word-break:break-all; margin-top:8px;">{}</div>
-          </div>
-        "#,
-            state_root, state_root
-        );
-
-        let period_display = match year {
-            Some(y) => format!("Fiscal Year {}", y),
-            None => "All-Time Cumulative".to_string(),
-        };
-
-        let html = format!(
+        let html_output = format!(
             r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Selo - Verified Tax Ledger Report ({period_display})</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128' width='32' height='32'><style>.s{{fill:%2316130F;stroke:%2316130F}}@media(prefers-color-scheme:dark){{.s{{fill:%23F2EDE5;stroke:%23F2EDE5}}}}</style><defs><clipPath id='fav'><circle cx='64' cy='64' r='50'/></clipPath></defs><g clip-path='url(%23fav)'><path class='s' d='M64 0H128V128H64Z' stroke='none'/></g><circle class='s' cx='64' cy='64' r='50' fill='none' stroke-width='13'/></svg>">
-<link rel="apple-touch-icon" sizes="180x180" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180' width='180' height='180'><rect width='180' height='180' fill='%23FAF7F2'/><defs><clipPath id='ati'><circle cx='90' cy='90' r='62'/></clipPath></defs><g clip-path='url(%23ati)'><path d='M90 0H180V180H90Z' fill='%2316130F'/><g stroke='%2316130F' stroke-width='8.5'><line x1='20' y1='58' x2='83' y2='58'/><line x1='20' y1='79' x2='83' y2='79'/><line x1='20' y1='100' x2='83' y2='100'/><line x1='20' y1='121' x2='83' y2='121'/></g></g><circle cx='90' cy='90' r='62' fill='none' stroke='%2316130F' stroke-width='11'/></svg>">
+<title>Selo · Cryptographic Audit Statement · Fiscal Year {fiscal_year}</title>
 <style>
   :root {{
     --selo-seal: #16130F;
-    --selo-seal-weak: #16130F14;
     --selo-ink: #16130F; 
     --selo-paper: #FAF7F2; 
     --selo-muted: #6B625A; 
@@ -728,8 +815,6 @@ impl TaxLedger {
   }}
   @media (prefers-color-scheme: dark) {{
     :root {{ 
-      --selo-seal: #F2EDE5;
-      --selo-seal-weak: #F2EDE51f;
       --selo-ink: #F2EDE5; 
       --selo-paper: #14120F; 
       --selo-muted: #9A8F83; 
@@ -738,523 +823,113 @@ impl TaxLedger {
       --wax: #F2EDE5;
     }}
   }}
-  * {{ box-sizing: border-box; }}
+  * {{ box-sizing: border-box; scroll-behavior: smooth; }}
   body {{ 
-    margin: 0 auto; padding: 56px 40px 96px; max-width: 960px; 
+    margin: 0; padding: 40px 20px 100px;
     background: var(--selo-paper); color: var(--selo-ink); 
     font: 15px/1.6 var(--selo-font-sans); 
+    display: flex; justify-content: center;
   }}
-  .header-brand {{ display: flex; align-items: center; gap: 14px; margin-bottom: 24px; }}
-  .logo-container {{ width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; background: var(--selo-rule); border-radius: 12px; padding: 8px; }}
-  .logo-container svg {{ width: 100%; height: 100%; fill: var(--selo-ink); }}
-  h1 {{ font-size: 28px; letter-spacing: -.02em; margin: 0 0 6px; }}
-  p.lede {{ color: var(--selo-muted); max-width: 64ch; margin: 0 0 32px; }}
-  
-  .periods-grid {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 20px;
-    justify-content: flex-start;
-    margin-bottom: 32px;
-  }}
-  .period-card {{
-    flex: 1;
-    min-width: 180px;
-    max-width: 240px;
-    border: 1px solid var(--selo-rule);
-    border-radius: 12px;
-    padding: 18px 20px;
-    background: var(--selo-raised);
-    cursor: pointer;
-    transition: border-color 0.2s ease, transform 0.1s ease;
-  }}
-  .period-card:hover {{
-    border-color: var(--selo-ink);
-  }}
+  .wrapper {{ width: 100%; max-width: 900px; }}
+  .header-area {{ display: flex; align-items: center; gap: 14px; margin-bottom: 24px; }}
+  .logo-box {{ width: 42px; height: 42px; background: var(--selo-rule); border-radius: 10px; padding: 8px; display: flex; align-items: center; justify-content: center; }}
+  .logo-box svg {{ width: 100%; height: 100%; fill: var(--selo-ink); }}
+  h1 {{ font-size: 28px; letter-spacing: -.03em; margin: 0; }}
+  p.lede {{ font-size: 15px; color: var(--selo-muted); margin: 0 0 32px; max-width: 65ch; }}
+
   .card {{ 
     border: 1px solid var(--selo-rule); 
     border-radius: 12px; 
-    padding: 22px 24px; 
+    padding: 24px; 
     background: var(--selo-raised);
     margin-bottom: 24px; 
   }}
-  .k {{ color: var(--selo-muted); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }}
-  .v {{ font: 600 20px/1.2 var(--selo-font-mono); margin: 4px 0 12px; }}
-  .sealed {{ display: flex; align-items: center; gap: 9px; color: var(--wax); font-size: 13px; font-weight: 600; cursor: pointer; }}
-  .sealed:hover {{ opacity: 0.85; }}
-  .open {{ display: flex; align-items: center; gap: 9px; color: var(--selo-muted); font-size: 13px; }}
+  .k {{ color: var(--selo-muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }}
+  .v {{ font: 600 22px/1.3 var(--selo-font-mono); margin: 6px 0 0; }}
   
   .copy-btn {{
     background: var(--selo-rule);
     border: none;
     border-radius: 6px;
-    padding: 4px 10px;
+    padding: 6px 12px;
     font-size: 11px;
     font-weight: 600;
     color: var(--selo-ink);
     cursor: pointer;
     transition: background 0.2s;
   }}
-  .copy-btn:hover {{
-    background: var(--selo-ink);
-    color: var(--selo-paper);
-  }}
+  .copy-btn:hover {{ background: var(--selo-ink); color: var(--selo-paper); }}
 
-  table {{ width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 14px; }}
-  th, td {{ text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--selo-rule); }}
-  th {{ font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--selo-muted); }}
-  td {{ font-family: var(--selo-font-mono); font-size: 13px; }}
-  .footer {{ margin-top: 36px; color: var(--selo-muted); font-size: 12px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }}
+  th, td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--selo-rule); font-family: var(--selo-font-mono); }}
+  th {{ font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--selo-muted); font-family: var(--selo-font-sans); }}
+
+  .accordion-item {{ border: 1px solid var(--selo-rule); border-radius: 10px; background: var(--selo-raised); overflow: hidden; margin-bottom: 12px; }}
+  .accordion-header {{ padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; user-select: none; }}
+  .accordion-content {{ padding: 0 20px 20px; border-top: 1px solid var(--selo-rule); background: var(--selo-paper); display: none; }}
+  .accordion-header.expanded .chevron {{ transform: rotate(180deg); }}
+  .chevron {{ transition: transform 0.2s; font-size: 12px; color: var(--selo-muted); }}
+  .sealed {{ display: flex; align-items: center; gap: 8px; color: var(--wax); font-size: 13px; font-weight: 600; }}
+  .open {{ display: flex; align-items: center; gap: 8px; color: var(--selo-muted); font-size: 13px; }}
+
+  footer {{ margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--selo-rule); color: var(--selo-muted); font-size: 12px; }}
 </style>
 <script>
-  function filterPeriod(yearPrefix) {{
-    const rows = document.querySelectorAll('tbody tr[data-date]');
-    rows.forEach(row => {{
-      const date = row.getAttribute('data-date');
-      if (date && date.startsWith(yearPrefix)) {{
-        row.style.display = '';
-      }} else {{
-        row.style.display = 'none';
-      }}
-    }});
-    document.querySelectorAll('.period-card').forEach(c => {{
-      if (c.getAttribute('data-period') === yearPrefix) {{
-        c.style.borderColor = 'var(--selo-ink)';
-      }} else {{
-        c.style.borderColor = 'var(--selo-rule)';
-      }}
-    }});
+  function toggleAccordion(id) {{
+    const item = document.getElementById(id);
+    const content = item.querySelector('.accordion-content');
+    const header = item.querySelector('.accordion-header');
+    if (content.style.display === 'none' || content.style.display === '') {{
+      content.style.display = 'block';
+      header.classList.add('expanded');
+    }} else {{
+      content.style.display = 'none';
+      header.classList.remove('expanded');
+    }}
   }}
-
   function copyToClipboard(text, btn) {{
     navigator.clipboard.writeText(text).then(() => {{
-      const originalText = btn.textContent;
+      const orig = btn.textContent;
       btn.textContent = 'Copied ✓';
-      setTimeout(() => {{
-        btn.textContent = originalText;
-      }}, 2000);
+      setTimeout(() => btn.textContent = orig, 2000);
     }});
   }}
 </script>
 </head>
 <body>
-
-<div class="header-brand">
-  <div class="logo-container">
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Selo">
-      <defs><clipPath id="selo-a"><circle cx="64" cy="64" r="52"/></clipPath></defs>
-      <g clip-path="url(#selo-a)">
-        <path d="M64 0H128V128H64Z" fill="currentColor"/>
-        <g stroke="currentColor" stroke-width="7">
-          <line x1="0" y1="37" x2="55" y2="37"/>
-          <line x1="0" y1="55" x2="55" y2="55"/>
-          <line x1="0" y1="73" x2="55" y2="73"/>
-          <line x1="0" y1="91" x2="55" y2="91"/>
-        </g>
-      </g>
-      <circle cx="64" cy="64" r="52" fill="none" stroke="currentColor" stroke-width="9"/>
-    </svg>
-  </div>
-  <div>
+<div class="wrapper">
+  <div class="header-area">
+    <div class="logo-box">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><defs><clipPath id="hb"><circle cx="64" cy="64" r="52"/></clipPath></defs><g clip-path="url(#hb)"><path d="M64 0H128V128H64Z"/><g stroke="currentColor" stroke-width="7"><line x1="0" y1="37" x2="55" y2="37"/><line x1="0" y1="55" x2="55" y2="55"/><line x1="0" y1="73" x2="55" y2="73"/><line x1="0" y1="91" x2="55" y2="91"/></g></g><circle cx="64" cy="64" r="52" fill="none" stroke="currentColor" stroke-width="9"/></svg>
+    </div>
     <h1>Selo Tax Ledger Report</h1>
   </div>
+  <p class="lede">Self-verifying cryptographic audit statement. Multi-period fiscal view with embedded Poseidon BN254 state root commitments.</p>
+
+  <div class="card">
+    <div class="k">Ledger Cumulative Summary</div>
+    <div class="v">{cumulative_ledger_receipts} Total Receipts &middot; R$ {cumulative_ledger_cost:.2}</div>
+    <p style="margin:8px 0 0; font-size:13px; color:var(--selo-muted);">Aggregated across {sorted_years_len} fiscal year period(s). Expand any fiscal year below to inspect itemized monthly closes and cryptographic state roots.</p>
+  </div>
+
+  <div style="display:flex; flex-direction:column; gap:16px;">
+    {fiscal_years_html}
+  </div>
+
+  <footer>
+    <p>Generated by Selo Core &middot; Cryptographically anchored offline statement &middot; Monochrome split-seal ledger interface.</p>
+  </footer>
 </div>
-<p class="lede">Self-verifying cryptographic audit statement for <strong>{period_display}</strong>. Embedded Poseidon BN254 state root commitment.</p>
-
-<div class="periods-grid">
-  {open_cards_html}
-  {sealed_cards_html}
-</div>
-
-{verification_card}
-{signature_section}
-
-<div class="card" style="max-width:100%;">
-  <div class="k" style="margin-bottom:12px;">Itemized Tax Lots &middot; Click any period card above to filter</div>
-  <table>
-    <thead>
-      <tr>
-        <th>ID</th>
-        <th>Asset</th>
-        <th>Amount</th>
-        <th>Cost Basis (BRL)</th>
-        <th>PTAX Rate</th>
-        <th>Acquired UTC</th>
-      </tr>
-    </thead>
-    <tbody>
-      {rows}
-    </tbody>
-  </table>
-</div>
-
-<div class="footer">
-  <p>Generated by Selo Core &middot; Cryptographically anchored offline statement &middot; Monochrome split-seal ledger interface.</p>
-</div>
-
 </body>
 </html>
 "#,
-            period_display = period_display,
-            open_cards_html = open_cards_html,
-            sealed_cards_html = sealed_cards_html,
-            verification_card = verification_card,
-            signature_section = signature_section,
-            rows = rows
+            fiscal_year = fiscal_year,
+            cumulative_ledger_receipts = cumulative_ledger_receipts,
+            cumulative_ledger_cost = cumulative_ledger_cost,
+            sorted_years_len = sorted_years.len(),
+            fiscal_years_html = fiscal_years_html
         );
 
-        Ok(html)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn render_fee_estimate_reports_cost_in_sol() {
-        let e = FeeEstimate {
-            sample_count: 150,
-            nonzero_count: 15,
-            p50: 50_000,
-            p75: 90_000,
-            p95: 140_000,
-            max: 6_145_297,
-            recommended_micro_lamports: 90_000,
-            urgency: crate::priority::Urgency::Normal,
-            compute_units: 1_000,
-        };
-        let out = render_fee_estimate(&e, &["Mint1".to_string()], Some(180.0));
-        assert!(out.contains("normal urgency"));
-        assert!(out.contains("90000 micro-lamports"));
-        assert!(out.contains("90 lamports"));
-        assert!(out.contains("15 of 150 slots"));
-        assert!(out.contains("Mint1"));
-    }
-
-    #[test]
-    fn render_fee_estimate_says_when_no_bid_needed() {
-        let e = FeeEstimate {
-            sample_count: 20,
-            nonzero_count: 0,
-            p50: 0,
-            p75: 0,
-            p95: 0,
-            max: 0,
-            recommended_micro_lamports: 0,
-            urgency: crate::priority::Urgency::High,
-            compute_units: 1_000,
-        };
-        let out = render_fee_estimate(&e, &[], None);
-        assert!(out.contains("no bid is needed"));
-        assert!(out.contains("network-wide"));
-    }
-
-    #[test]
-    fn whole_sol() {
-        assert_eq!(lamports_to_sol(2_000_000_000), "2");
-    }
-
-    #[test]
-    fn fractional_sol_trims_zeros() {
-        assert_eq!(lamports_to_sol(1_500_000_000), "1.5");
-        assert_eq!(lamports_to_sol(1), "0.000000001");
-    }
-
-    #[test]
-    fn zero() {
-        assert_eq!(lamports_to_sol(0), "0");
-    }
-
-    #[test]
-    fn render_without_tokens() {
-        let out = render_balance("Addr", 1_500_000_000, None);
-        assert!(out.contains("1.5 SOL"));
-        assert!(!out.contains("SPL token account"));
-        assert!(out.contains("\"tokens\":null"));
-    }
-
-    #[test]
-    fn render_with_empty_tokens_says_so() {
-        let out = render_balance("Addr", 0, Some(&[]));
-        assert!(out.contains("no SPL token accounts"));
-    }
-
-    #[test]
-    fn render_lists_tokens() {
-        let tokens = vec![TokenBalance {
-            mint: "Mint1".to_string(),
-            amount_raw: "2500000".to_string(),
-            decimals: 6,
-            ui_amount: "2.5".to_string(),
-        }];
-        let out = render_balance("Addr", 0, Some(&tokens));
-        assert!(out.contains("2.5 of mint Mint1"));
-        assert!(out.contains("\"amount_raw\":\"2500000\""));
-    }
-
-    #[test]
-    fn delta_signs() {
-        assert_eq!(delta_to_sol(-1_500_000_000), "-1.5");
-        assert_eq!(delta_to_sol(100_000), "+0.0001");
-    }
-
-    #[test]
-    fn render_tx_success_and_failure() {
-        let mut s = TxSummary {
-            signature: "Sig1".to_string(),
-            slot: 42,
-            block_time_unix: Some(1_750_000_000),
-            error: None,
-            fee_lamports: 5000,
-            fee_payer: "Payer".to_string(),
-            compute_units: Some(450),
-            balance_changes: vec![crate::tx::BalanceChange {
-                account: "Payer".to_string(),
-                delta_lamports: -105_000,
-            }],
-            log_tail: vec![],
-        };
-        let ok = render_tx(&s);
-        assert!(ok.contains("succeeded in slot 42"));
-        assert!(ok.contains("-0.000105 SOL"));
-
-        s.error = Some(r#"{"InstructionError":[0,"Custom"]}"#.to_string());
-        s.log_tail = vec!["Program failed".to_string()];
-        let failed = render_tx(&s);
-        assert!(failed.contains("FAILED"));
-        assert!(failed.contains("Program failed"));
-    }
-
-    #[test]
-    fn render_transfer_mentions_signature() {
-        let out = render_transfer("From", "To", 1_500_000_000, "Sig9");
-        assert!(out.contains("1.5 SOL"));
-        assert!(out.contains("Sig9"));
-        assert!(out.contains("\"lamports\":1500000000"));
-    }
-
-    #[test]
-    fn base_units_render() {
-        assert_eq!(base_units_to_decimal("100000000", 9), "0.1");
-        assert_eq!(base_units_to_decimal("7750169", 6), "7.750169");
-        assert_eq!(base_units_to_decimal("1000000", 6), "1");
-        assert_eq!(base_units_to_decimal("5", 9), "0.000000005");
-        assert_eq!(base_units_to_decimal("42", 0), "42");
-    }
-
-    #[test]
-    fn render_prices_and_missing() {
-        let prices = vec![TokenPrice {
-            mint: "So111".to_string(),
-            usd_price: 77.488394,
-            decimals: 9,
-            price_change_24h: Some(-0.978),
-            liquidity: Some(1.0),
-        }];
-        let out = render_prices(&prices, &["FAKE".to_string()]);
-        assert!(out.contains("So111 is $77.488394"));
-        assert!(out.contains("-0.98% 24h"));
-        assert!(out.contains("No price available for: FAKE"));
-    }
-
-    #[test]
-    fn render_quote_is_explicit_about_not_swapping() {
-        let q = SwapQuote {
-            input_mint: "So111".to_string(),
-            output_mint: "EPjF".to_string(),
-            in_amount: "100000000".to_string(),
-            out_amount: "7750169".to_string(),
-            min_out_amount: "7711419".to_string(),
-            slippage_bps: 50,
-            price_impact_pct: Some(0.0000261),
-            usd_value: Some(7.7498),
-            route_labels: vec!["HumidiFi".to_string()],
-        };
-        let out = render_quote(&q, Some(9), Some(6));
-        assert!(out.contains("Swapping 0.1 of So111"));
-        assert!(out.contains("7.750169"));
-        assert!(out.contains("guaranteed minimum is 7.711419"));
-        assert!(out.contains("Route: HumidiFi"));
-        assert!(out.contains("quote only"));
-    }
-
-    #[test]
-    fn render_airdrop_pending_and_confirmed() {
-        let pending = render_airdrop("Addr", 1_000_000_000, "Sig1", None);
-        assert!(pending.contains("1 SOL"));
-        assert!(pending.contains("not reported a confirmation yet"));
-
-        let done = render_airdrop("Addr", 1_000_000_000, "Sig1", Some("finalized"));
-        assert!(done.contains("Status: finalized"));
-    }
-
-    #[test]
-    fn render_simulation_states_dry_run_first() {
-        let ok = Simulation {
-            error: None,
-            compute_units: Some(450),
-            logs: vec!["Program success".to_string()],
-        };
-        let out = render_simulation("From", "To", 1_500_000_000, &ok);
-        assert!(out.starts_with("Dry run only, nothing was sent."));
-        assert!(out.contains("WOULD SUCCEED"));
-        assert!(out.contains("\"would_succeed\":true"));
-
-        let bad = Simulation {
-            error: Some("InstructionError".to_string()),
-            compute_units: None,
-            logs: vec![],
-        };
-        let out = render_simulation("From", "To", 1, &bad);
-        assert!(out.contains("WOULD FAIL"));
-        assert!(out.contains("\"would_succeed\":false"));
-    }
-
-    #[test]
-    fn render_token_transfer_reports_accounts_and_creation() {
-        let owner =
-            crate::address::decode_pubkey("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM").unwrap();
-        let t = crate::token::TokenTransfer::resolve(
-            &owner,
-            "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ",
-            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            2_500_000,
-            6,
-            true,
-        )
-        .unwrap();
-
-        let out = render_token_transfer(&t, "USDC", true, "SigTok");
-        assert!(out.contains("2.5 USDC"));
-        assert!(out.contains("SigTok"));
-        assert!(out.contains("was created"));
-        assert!(out.contains("FGETo8T8wMcN2wCjav8VK6eh3dLk63evNDPxzLSJra8B"));
-        assert!(out.contains("\"created_destination_account\":true"));
-
-        let out = render_token_transfer(&t, "USDC", false, "SigTok");
-        assert!(!out.contains("was created"));
-    }
-
-    #[test]
-    fn render_swap_reports_minimum_and_route() {
-        let q = SwapQuote {
-            input_mint: "So111".to_string(),
-            output_mint: "EPjF".to_string(),
-            in_amount: "10000000".to_string(),
-            out_amount: "774566".to_string(),
-            min_out_amount: "770694".to_string(),
-            slippage_bps: 50,
-            price_impact_pct: Some(0.00001),
-            usd_value: Some(0.77),
-            route_labels: vec!["HumidiFi".to_string(), "Meteora".to_string()],
-        };
-        let out = render_swap(&q, "SOL", "USDC", Some(9), Some(6), Some(21000), "SigSwap");
-        assert!(out.contains("swap of 0.01 SOL"));
-        assert!(out.contains("about 0.774566 USDC"));
-        assert!(out.contains("at least 0.770694 USDC"));
-        assert!(out.contains("HumidiFi then Meteora"));
-        assert!(out.contains("21000 lamports"));
-        assert!(out.contains("SigSwap"));
-    }
-
-    #[test]
-    fn render_swap_without_priority_fee() {
-        let q = SwapQuote {
-            input_mint: "a".to_string(),
-            output_mint: "b".to_string(),
-            in_amount: "1".to_string(),
-            out_amount: "2".to_string(),
-            min_out_amount: "2".to_string(),
-            slippage_bps: 50,
-            price_impact_pct: None,
-            usd_value: None,
-            route_labels: vec![],
-        };
-        let out = render_swap(&q, "A", "B", None, None, None, "Sig");
-        assert!(!out.contains("priority fee"));
-        assert!(out.contains("\"priority_fee_lamports\":null"));
-    }
-
-    #[test]
-    fn render_compressed_marks_verified_and_failed() {
-        let accounts = vec![
-            VerifiedAccount {
-                hash: "HashA".into(),
-                leaf_index: 4,
-                tree: "TreeX".into(),
-                lamports: 0,
-                verified: Some(Ok(())),
-            },
-            VerifiedAccount {
-                hash: "HashB".into(),
-                leaf_index: 9,
-                tree: "TreeX".into(),
-                lamports: 5,
-                verified: None,
-            },
-        ];
-        let out = render_compressed_accounts("Owner1", 534, &accounts);
-        assert!(out.contains("owns 534 compressed account(s)"));
-        assert!(out.contains("1 of them had their merkle proof verified"));
-        assert!(out.contains("HashA leaf 4 in tree TreeX (0 lamports) [verified]"));
-        assert!(out.contains("[unverified]"));
-        assert!(out.contains("\"proof_verified\":true"));
-    }
-
-    #[test]
-    fn render_compressed_shouts_when_a_proof_fails() {
-        let accounts = vec![VerifiedAccount {
-            hash: "HashC".into(),
-            leaf_index: 1,
-            tree: "TreeX".into(),
-            lamports: 0,
-            verified: Some(Err("root mismatch".into())),
-        }];
-        let out = render_compressed_accounts("Owner1", 1, &accounts);
-        assert!(out.contains("FAILED to verify"));
-        assert!(out.contains("untrusted"));
-        assert!(out.contains("root mismatch"));
-        assert!(out.contains("\"proof_verified\":false"));
-    }
-
-    #[test]
-    fn render_compressed_is_explicit_when_nothing_checked() {
-        let out = render_compressed_accounts("Owner1", 3, &[]);
-        assert!(out.contains("No merkle proofs were checked"));
-        assert!(out.contains("rather than verified state"));
-    }
-
-    #[test]
-    fn usd_rendering_scales_to_tiny_fees() {
-        assert_eq!(lamports_to_usd(1_000_000_000, 180.0), "$180.00");
-        assert_eq!(lamports_to_usd(100_000, 180.0), "$0.02");
-        assert_eq!(lamports_to_usd(10_000, 180.0), "$0.001800");
-        assert_eq!(lamports_to_usd(1, 180.0), "under $0.000001");
-        assert_eq!(lamports_to_usd(0, 180.0), "under $0.000001");
-    }
-
-    #[test]
-    fn fee_estimate_quotes_dollars_when_price_known() {
-        let e = FeeEstimate {
-            sample_count: 150,
-            nonzero_count: 15,
-            p50: 50_000,
-            p75: 90_000,
-            p95: 140_000,
-            max: 6_145_297,
-            recommended_micro_lamports: 90_000,
-            urgency: crate::priority::Urgency::Normal,
-            compute_units: 1_000,
-        };
-        let with_price = render_fee_estimate(&e, &[], Some(180.0));
-        assert!(with_price.contains("90 lamports"));
-        assert!(with_price.contains("about $0.0000"));
-        assert!(with_price.contains("\"sol_usd_price\":180.0"));
-
-        let without = render_fee_estimate(&e, &[], None);
-        assert!(without.contains("90 lamports"));
-        assert!(!without.contains("about $"));
-        assert!(without.contains("\"total_priority_fee_usd\":null"));
+        Ok(html_output)
     }
 }

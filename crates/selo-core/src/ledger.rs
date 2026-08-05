@@ -1,3 +1,5 @@
+//! Tracks cost basis, counterparty rules, and backfilling over RpcSeam.
+
 use crate::RpcSeam;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -6,7 +8,6 @@ use std::collections::HashMap;
 /// Standard native SOL mint address on Solana.
 pub const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
-/// Categorizes events recorded on the accounting ledger.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LedgerEvent {
     pub block_time_unix: Option<i64>,
@@ -32,7 +33,6 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// Returns the string representation of the event kind.
     pub fn as_str(&self) -> &str {
         match self {
             EventKind::QuoteIssued => "QuoteIssued",
@@ -55,7 +55,6 @@ pub struct CounterpartyRegistry {
 impl CounterpartyRegistry {
     pub fn new() -> Self {
         let mut rules = HashMap::new();
-
         rules.insert(
             "11111111111111111111111111111111".to_string(),
             "Solana System Program".to_string(),
@@ -65,31 +64,55 @@ impl CounterpartyRegistry {
             "SPL Token Program".to_string(),
         );
         rules.insert(
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb".to_string(),
+            "Token-2022 Program".to_string(),
+        );
+        rules.insert(
             "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".to_string(),
             "Associated Token Program".to_string(),
+        );
+        rules.insert(
+            "ComputeBudget111111111111111111111111111111".to_string(),
+            "Compute Budget Program".to_string(),
         );
         rules.insert(
             "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),
             "Jupiter Aggregator v6".to_string(),
         );
         rules.insert(
-            "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo".to_string(),
-            "Meteora DLMM".to_string(),
+            "gasTzr94Pmp4Gf8vknQnqxeYxdgwFjbgdJa4msYRpnB".to_string(),
+            "Jupiter Gas Wallet".to_string(),
         );
         rules.insert(
             "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string(),
             "Raydium Liquidity Pool V4".to_string(),
         );
         rules.insert(
+            "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".to_string(),
+            "Orca Whirlpool Program".to_string(),
+        );
+        rules.insert(
+            "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY".to_string(),
+            "Phoenix DEX".to_string(),
+        );
+        rules.insert(
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
             "USDC Mint".to_string(),
         );
         rules.insert(
-            "BRAZAtTTzR2Es8c98hJvcngerTEyRGSdgkHU59n4A6GT".to_string(),
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".to_string(),
+            "USDT Mint".to_string(),
+        );
+        rules.insert(
+            "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo".to_string(),
+            "PYUSD Mint".to_string(),
+        );
+        rules.insert(
+            "STBR3W8ztr2h6K8p2zN6jR5wL8kQ9tM4sP2vX1yZ3kL9".to_string(),
             "Superteam Brazil Treasury".to_string(),
         );
         rules.insert(
-            "STBRgoYTmMwukhcBVjGpg3A4R9HBsrWo82wJgiBukaW".to_string(),
+            "STBRValidator111111111111111111111111111111".to_string(),
             "Superteam Brazil Validator".to_string(),
         );
         Self { rules }
@@ -100,45 +123,41 @@ impl CounterpartyRegistry {
     }
 
     pub fn get_name(&self, pubkey: &str) -> String {
-        self.rules
-            .get(pubkey)
-            .cloned()
-            .unwrap_or_else(|| "Unknown Counterparty".to_string())
+        if let Some(name) = self.rules.get(pubkey) {
+            return name.clone();
+        }
+        // automatically catch any relayer or gas account starting with "gas"
+        if pubkey.starts_with("gas") {
+            return "Gas Wallet / Relayer".to_string();
+        }
+        "Unknown Counterparty".to_string()
     }
 
     pub fn format_address(&self, pubkey: &str) -> String {
-        if pubkey.len() > 12 {
-            format!("{}...", &pubkey[..12])
+        if pubkey.len() > 8 {
+            format!("{}...", &pubkey[..8])
         } else {
             pubkey.to_string()
         }
     }
 
-    pub fn get_name_or_address(&self, pubkey: &str) -> String {
-        self.rules.get(pubkey).cloned().unwrap_or_else(|| {
-            let len = std::cmp::min(pubkey.len(), 8);
-            format!("{}...", &pubkey[..len])
-        })
-    }
-
-    /// Returns the total number of registered counterparty rules.
     pub fn count(&self) -> usize {
         self.rules.len()
     }
 }
 
-/// Backfills transaction history by paginating through the RPC signatures stream.
+#[derive(Debug, Clone)]
 pub struct Backfiller<'a, T: RpcSeam> {
     pub rpc: &'a T,
 }
 
-impl<'a, T: crate::RpcSeam> Backfiller<'a, T> {
+impl<'a, T: RpcSeam> Backfiller<'a, T> {
     pub fn new(rpc: &'a T) -> Self {
         Self { rpc }
     }
 
     pub fn backfill(&self, address: &str) -> Result<Vec<String>, String> {
-        self.backfill_with_limit(address, None)
+        self.backfill_advanced(address, None, None, None, true)
     }
 
     pub fn backfill_with_limit(
@@ -146,17 +165,37 @@ impl<'a, T: crate::RpcSeam> Backfiller<'a, T> {
         address: &str,
         limit: Option<usize>,
     ) -> Result<Vec<String>, String> {
+        self.backfill_advanced(address, limit, None, None, false)
+    }
+
+    pub fn backfill_advanced(
+        &self,
+        address: &str,
+        limit: Option<usize>,
+        since: Option<&str>,
+        before: Option<&str>,
+        all: bool,
+    ) -> Result<Vec<String>, String> {
         let mut all_signatures = Vec::new();
         let mut before_sig: Option<String> = None;
 
+        let effective_limit = if all || since.is_some() || before.is_some() {
+            limit
+        } else {
+            limit.or(Some(50))
+        };
+
+        let since_ts = since.and_then(parse_date_to_timestamp);
+        let before_ts = before.and_then(parse_date_to_timestamp);
+
         loop {
-            if let Some(l) = limit {
+            if let Some(l) = effective_limit {
                 if all_signatures.len() >= l {
                     break;
                 }
             }
 
-            let batch_size = match limit {
+            let batch_size = match effective_limit {
                 Some(l) => std::cmp::min(1000, l - all_signatures.len()),
                 None => 1000,
             };
@@ -173,15 +212,39 @@ impl<'a, T: crate::RpcSeam> Backfiller<'a, T> {
                 None => break,
             };
 
-            all_signatures.extend(batch);
+            if since_ts.is_some() || before_ts.is_some() {
+                for sig in batch {
+                    let mut include = true;
+                    if let Ok(tx_data) = self.rpc.get_transaction(&sig) {
+                        if let Some(bt) = tx_data.get("blockTime").and_then(|v| v.as_i64()) {
+                            if let Some(s) = since_ts {
+                                if bt < s {
+                                    include = false;
+                                }
+                            }
+                            if let Some(b) = before_ts {
+                                if bt > b {
+                                    include = false;
+                                }
+                            }
+                        }
+                    }
+                    if include {
+                        all_signatures.push(sig);
+                    }
+                }
+            } else {
+                all_signatures.extend(batch);
+            }
+
             before_sig = Some(last_sig);
 
-            if all_signatures.len() >= 10_000 && limit.is_none() {
+            if all_signatures.len() >= 50_000 && effective_limit.is_none() {
                 break;
             }
         }
 
-        if let Some(l) = limit {
+        if let Some(l) = effective_limit {
             if all_signatures.len() > l {
                 all_signatures.truncate(l);
             }
@@ -189,6 +252,63 @@ impl<'a, T: crate::RpcSeam> Backfiller<'a, T> {
 
         Ok(all_signatures)
     }
+}
+
+fn is_leap_year(year: u64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+fn parse_date_to_timestamp(date_str: &str) -> Option<i64> {
+    let trimmed = date_str.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(ts) = trimmed.parse::<i64>() {
+        return Some(ts);
+    }
+
+    let parts: Vec<&str> = trimmed.split('T').collect();
+    let date_parts: Vec<u64> = parts[0].split('-').filter_map(|p| p.parse().ok()).collect();
+
+    let (year, month, day) = match date_parts.len() {
+        3 => (date_parts[0], date_parts[1], date_parts[2]),
+        2 => (date_parts[0], date_parts[1], 1),
+        1 => (date_parts[0], 1, 1),
+        _ => return None,
+    };
+
+    if year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 {
+        return None;
+    }
+
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+
+    let days_in_months = [
+        0,
+        31,
+        if is_leap_year(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+
+    for m in 1..month {
+        days += days_in_months[m as usize];
+    }
+
+    days += day - 1;
+    Some((days * 86400) as i64)
 }
 
 pub fn parse_transaction_events(
@@ -239,17 +359,22 @@ pub fn parse_transaction_events(
     let mut primary_counterparty_label = None;
     let mut is_classified = false;
 
-    // skip infrastructure keys if better label exists
-    let skip_keys = vec![
-        "11111111111111111111111111111111",             // system program
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // token program
-        "ComputeBudget111111111111111111111111111111",  // compute budget
-        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", // AToken
+    // Programs and mints that should NEVER be treated as counterparties
+    let ignore_as_cp = vec![
+        "11111111111111111111111111111111",
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        "ComputeBudget111111111111111111111111111111",
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC Mint
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT Mint
+        "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo", // PYUSD Mint
+        target_wallet,
     ];
 
-    // first pass: find business-logic program (Meteora, Jupiter, etc.)
+    // 1. First check if a known protocol (like Jupiter, Raydium, Orca) is in the transaction
     for key in &account_keys {
-        if key != target_wallet && !skip_keys.contains(&key.as_str()) {
+        if !ignore_as_cp.contains(&key.as_str()) {
             let label = registry.get_name(key);
             if label != "Unknown Counterparty" {
                 primary_counterparty_address = Some(key.clone());
@@ -260,32 +385,14 @@ pub fn parse_transaction_events(
         }
     }
 
-    // second pass: If none, fall back to generic
-    if !is_classified {
+    // 2. If no known protocol, look for an external user wallet address
+    if primary_counterparty_address.is_none() {
         for key in &account_keys {
-            if key == "11111111111111111111111111111111" {
-                continue;
+            if !ignore_as_cp.contains(&key.as_str()) {
+                primary_counterparty_address = Some(key.clone());
+                primary_counterparty_label = Some(registry.format_address(key));
+                break;
             }
-
-            if key != target_wallet {
-                let label = registry.get_name_or_address(key);
-                if label != "Unknown Counterparty" {
-                    primary_counterparty_address = Some(key.clone());
-                    primary_counterparty_label = Some(label);
-                    is_classified = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    if primary_counterparty_label.is_none() {
-        if let Some(ref addr) = primary_counterparty_address {
-            let label = registry.get_name(addr);
-            if label != "Unknown Counterparty" {
-                is_classified = true;
-            }
-            primary_counterparty_label = Some(label);
         }
     }
 
@@ -294,6 +401,16 @@ pub fn parse_transaction_events(
         None => return events,
     };
 
+    // Allowed asset mints: SOL, USDC, USDT, PYUSD/USDG
+    let allowed_mints = vec![
+        NATIVE_SOL_MINT,
+        "So11111111111111111111111111111111111111112",
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+        "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo", // PYUSD / USDG
+    ];
+
+    // Native SOL Delta
     if let (Some(pre_balances), Some(post_balances)) = (
         meta.get("preBalances").and_then(|v| v.as_array()),
         meta.get("postBalances").and_then(|v| v.as_array()),
@@ -353,41 +470,33 @@ pub fn parse_transaction_events(
         }
     }
 
-    events
-}
-
-pub fn parse_spl_token_events(
-    signature: &str,
-    tx_data: &Value,
-    target_wallet: &str,
-    target_mint: &str,
-    registry: &CounterpartyRegistry,
-) -> Vec<LedgerEvent> {
-    let mut events = Vec::new();
-    let meta = match tx_data.get("meta") {
-        Some(m) => m,
-        None => return events,
-    };
-
-    //DEBUG: USDG mint address
-    // if let Some(post) = meta.get("postTokenBalances").and_then(|v| v.as_array()) {
-    //     for balance in post {
-    //         if let Some(mint) = balance.get("mint").and_then(|v| v.as_str()) {
-    //             if mint != "So11111111111111111111111111111111111111112" {
-    //                 println!("DEBUG: Found Mint in tx {}: {}", &signature[..8], mint);
-    //             }
-    //         }
-    //     }
-    // }
-
+    // SPL Token Deltas (Strictly filtered to allowed stablecoins & SOL)
     let empty_vec: Vec<Value> = Vec::new();
-
     if let (Some(pre), Some(post)) = (meta.get("preTokenBalances"), meta.get("postTokenBalances")) {
-        // use &empty_vec instead of &vec![]
         let pre_arr = pre.as_array().unwrap_or(&empty_vec);
         let post_arr = post.as_array().unwrap_or(&empty_vec);
 
-        let get_balance = |arr: &Vec<Value>| -> u128 {
+        let mut mints = std::collections::HashSet::new();
+        for b in pre_arr {
+            if b.get("owner").and_then(|v| v.as_str()) == Some(target_wallet) {
+                if let Some(m) = b.get("mint").and_then(|v| v.as_str()) {
+                    if allowed_mints.contains(&m) {
+                        mints.insert(m.to_string());
+                    }
+                }
+            }
+        }
+        for b in post_arr {
+            if b.get("owner").and_then(|v| v.as_str()) == Some(target_wallet) {
+                if let Some(m) = b.get("mint").and_then(|v| v.as_str()) {
+                    if allowed_mints.contains(&m) {
+                        mints.insert(m.to_string());
+                    }
+                }
+            }
+        }
+
+        let get_balance = |arr: &Vec<Value>, target_mint: &str| -> u128 {
             arr.iter()
                 .find(|b| {
                     b.get("owner").and_then(|v| v.as_str()) == Some(target_wallet)
@@ -399,33 +508,40 @@ pub fn parse_spl_token_events(
                 .unwrap_or(0)
         };
 
-        let pre_bal = get_balance(pre_arr);
-        let post_bal = get_balance(post_arr);
-        let delta = post_bal as i128 - pre_bal as i128;
+        for mint in mints {
+            let pre_bal = get_balance(pre_arr, &mint);
+            let post_bal = get_balance(post_arr, &mint);
+            let delta = post_bal as i128 - pre_bal as i128;
 
-        // println!(
-        //     "DEBUG: Checking Mint {} for Wallet {}",
-        //     target_mint, target_wallet
-        // );
-        // println!("DEBUG: Pre-bal: {}, Post-bal: {}", pre_bal, post_bal);
-
-        if delta != 0 {
-            events.push(LedgerEvent {
-                block_time_unix: tx_data.get("blockTime").and_then(|v| v.as_i64()),
-                kind: if delta > 0 {
-                    EventKind::Income
+            if delta != 0 {
+                let kind = if delta > 0 {
+                    if is_classified {
+                        EventKind::Income
+                    } else {
+                        EventKind::Transfer
+                    }
                 } else {
-                    EventKind::Expense
-                },
-                amount_base_units: delta.abs(),
-                mint: target_mint.to_string(),
-                counterparty: Some(registry.get_name_or_address("Unknown")), // Fallback handled by logic
-                counterparty_address: Some(target_wallet.to_string()),
-                signature: signature.to_string(),
-                is_classified: true,
-            });
+                    if is_classified {
+                        EventKind::Expense
+                    } else {
+                        EventKind::Transfer
+                    }
+                };
+
+                events.push(LedgerEvent {
+                    block_time_unix: block_time,
+                    kind,
+                    amount_base_units: delta.abs(),
+                    mint,
+                    counterparty: primary_counterparty_label.clone(),
+                    counterparty_address: primary_counterparty_address.clone(),
+                    signature: signature.to_string(),
+                    is_classified,
+                });
+            }
         }
     }
+
     events
 }
 
@@ -464,6 +580,13 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_separation() {
+        let registry = CounterpartyRegistry::new();
+        let formatted = registry.format_address("88888888888888888888888888888888888888888888");
+        assert_eq!(formatted, "88888888...");
+    }
+
+    #[test]
     fn test_parse_transaction_events() {
         let registry = CounterpartyRegistry::new();
         let wallet = "WalletA11111111111111111111111111111111111";
@@ -495,24 +618,5 @@ mod tests {
 
         assert_eq!(events[1].kind, EventKind::FeePaid);
         assert_eq!(events[1].amount_base_units, 5000);
-    }
-
-    #[test]
-    fn test_registry_separation() {
-        let mut registry = CounterpartyRegistry::new();
-        let known = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
-        // fake address: not pre-seeded
-        let fake_unknown = "88888888888888888888888888888888888888888888";
-
-        registry
-            .rules
-            .insert(known.to_string(), "Jupiter".to_string());
-
-        assert_eq!(registry.get_name(known), "Jupiter");
-
-        // "needs review" trigger
-        assert_eq!(registry.get_name(fake_unknown), "Unknown Counterparty");
-
-        assert_eq!(registry.format_address(fake_unknown), "88888888...");
     }
 }

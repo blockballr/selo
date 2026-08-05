@@ -1,11 +1,50 @@
 //! Tax Lot Accounting Engine
 //!
 //! tracks cost basis and acquisition history for token streams using FIFO/LIFO matching
-
+//!
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use light_poseidon::{Poseidon, PoseidonHasher};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MultiWalletLedger {
+    pub wallets: BTreeMap<String, TaxLedger>,
+}
+
+impl MultiWalletLedger {
+    pub fn new() -> Self {
+        Self {
+            wallets: BTreeMap::new(),
+        }
+    }
+
+    /// Retrieve a reference to a wallet's tax ledger
+    pub fn get_ledger(&self, pubkey: &str) -> Option<&TaxLedger> {
+        self.wallets.get(pubkey)
+    }
+
+    /// Retrieve a mutable reference to a wallet's tax ledger, creating one if absent
+    pub fn get_mut_ledger(&mut self, pubkey: &str) -> &mut TaxLedger {
+        self.wallets.entry(pubkey.to_string()).or_default()
+    }
+
+    /// Generate a cumulative tax ledger combining all lots across all stored wallets
+    pub fn cumulative_ledger(&self) -> TaxLedger {
+        let mut combined = TaxLedger::new();
+        for ledger in self.wallets.values() {
+            combined.lots.extend(ledger.lots.clone());
+            combined
+                .unclassified_counterparties
+                .extend(ledger.unclassified_counterparties.clone());
+        }
+        combined
+            .lots
+            .sort_by(|a, b| a.acquired_at_utc.cmp(&b.acquired_at_utc));
+        combined
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaxLot {
@@ -28,11 +67,16 @@ pub struct PtaxQuote {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TaxLedger {
     pub lots: Vec<TaxLot>,
+    #[serde(default)]
+    pub unclassified_counterparties: BTreeSet<String>,
 }
 
 impl TaxLedger {
     pub fn new() -> Self {
-        Self { lots: Vec::new() }
+        Self {
+            lots: Vec::new(),
+            unclassified_counterparties: BTreeSet::new(),
+        }
     }
 
     /// add new acquired lot to the tracking ledger
@@ -40,25 +84,26 @@ impl TaxLedger {
         self.lots.push(lot);
     }
 
-    /// fetch PTAX rate and record a new acquisition in one go
+    /// record a new acquisition with historical PTAX rate (with built-in deduplication)
     pub fn record_acquisition(
         &mut self,
         id: String,
         asset_symbol: String,
         amount: u64,
+        ptax_rate_brl: f64,
         acquired_at_utc: String,
     ) -> Result<(), String> {
-        let ptax_rate = crate::ptax::fetch_latest_ptax()?;
-
-        let unit_cost_basis_brl = ptax_rate;
+        if self.lots.iter().any(|l| l.id == id) {
+            return Ok(()); // Lot already exists; skip silently for efficient subsequent runs
+        }
 
         let lot = TaxLot {
             id,
             asset_symbol,
             amount,
-            unit_cost_basis_brl,
+            unit_cost_basis_brl: ptax_rate_brl,
             acquired_at_utc,
-            ptax_rate_used: ptax_rate,
+            ptax_rate_used: ptax_rate_brl,
         };
 
         self.add_lot(lot);
@@ -109,7 +154,6 @@ impl TaxLedger {
         Ok(total_cost_basis_brl)
     }
 
-    /// compute: ZK-friendly Poseidon state root over the BN254 scalar field
     pub fn compute_state_root(&self) -> Result<String, String> {
         if self.lots.is_empty() {
             return Ok("0x0".to_string());
@@ -186,7 +230,10 @@ mod tests {
 
     #[test]
     fn test_poseidon_state_root_determinism() {
-        let ledger1 = TaxLedger { lots: vec![] };
+        let ledger1: TaxLedger = TaxLedger {
+            lots: vec![],
+            ..Default::default()
+        };
         assert_eq!(ledger1.compute_state_root().unwrap(), "0x0");
 
         let sample_lot = TaxLot {
@@ -198,16 +245,18 @@ mod tests {
             acquired_at_utc: "2026-08-04T12:00:00Z".to_string(),
         };
 
-        let ledger_a = TaxLedger {
+        let ledger_a: TaxLedger = TaxLedger {
             lots: vec![sample_lot.clone()],
+            ..Default::default()
         };
-        let root_a = ledger_a.compute_state_root().unwrap();
+        let root_a: String = ledger_a.compute_state_root().unwrap();
         assert_ne!(root_a, "0x0");
 
-        let ledger_b = TaxLedger {
+        let ledger_b: TaxLedger = TaxLedger {
             lots: vec![sample_lot],
+            ..Default::default()
         };
-        let root_b = ledger_b.compute_state_root().unwrap();
+        let root_b: String = ledger_b.compute_state_root().unwrap();
 
         // Verify that identical ledgers produce identical Poseidon commitments
         assert_eq!(

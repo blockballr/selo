@@ -233,13 +233,12 @@ pub fn compile_message(
             (false, false) => 3,
         }
     }
-    merged.sort_by_key(rank);
 
-    if merged[0].pubkey != *fee_payer {
-        // Unreachable given the stable sort, but a silent mismatch here
-        // would mean the wrong account pays, so it is checked.
-        return Err("fee payer did not land at account index 0".to_string());
-    }
+    // Ensure fee payer is explicitly kept at index 0 before sorting other accounts
+    let fee_payer_meta = AccountMeta::signer_writable(*fee_payer);
+    merged.retain(|m| m.pubkey != *fee_payer);
+    merged.sort_by_key(rank);
+    merged.insert(0, fee_payer_meta);
 
     let num_required_signatures = merged.iter().filter(|m| m.is_signer).count();
     let num_readonly_signed = merged
@@ -272,8 +271,7 @@ pub fn compile_message(
     ];
 
     let mut msg = Vec::with_capacity(256);
-    // Prefix for v0 transaction (bit 7 set)
-    msg.push(0x80);
+    // Legacy transactions start directly with the 3-byte header
     msg.extend_from_slice(&header);
 
     // Static account keys length
