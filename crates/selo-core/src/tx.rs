@@ -231,8 +231,10 @@ mod tests {
 
     #[test]
     fn failed_tx_keeps_error_and_log_tail() {
-        let body = success_body()
-            .replace(r#""err": null"#, r#""err": {"InstructionError":[0,"Custom"]}"#);
+        let body = success_body().replace(
+            r#""err": null"#,
+            r#""err": {"InstructionError":[0,"Custom"]}"#,
+        );
         let summary = parse_tx(&valid_sig(), &body).unwrap().unwrap();
         let err = summary.error.expect("error should be set");
         assert!(err.contains("InstructionError"));

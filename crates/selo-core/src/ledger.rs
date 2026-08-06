@@ -144,6 +144,29 @@ impl CounterpartyRegistry {
     pub fn count(&self) -> usize {
         self.rules.len()
     }
+    /// find a registered counterparty address by its human-readable name (case-insensitive).
+    pub fn find_address_by_name(&self, name_query: &str) -> Option<String> {
+        let query_lower = name_query.trim().to_lowercase();
+        if query_lower.is_empty() {
+            return None;
+        }
+
+        // 1. Try exact case-insensitive match first
+        for (addr, name) in &self.rules {
+            if name.to_lowercase() == query_lower {
+                return Some(addr.clone());
+            }
+        }
+
+        // 2. Fallback to substring / partial match
+        for (addr, name) in &self.rules {
+            if name.to_lowercase().contains(&query_lower) {
+                return Some(addr.clone());
+            }
+        }
+
+        None
+    }
 }
 
 #[derive(Debug, Clone)]

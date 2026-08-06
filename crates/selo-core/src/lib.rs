@@ -1,7 +1,7 @@
 pub mod address;
 pub mod basis;
-pub mod brain;
 pub mod catalog;
+pub mod close;
 pub mod config;
 pub mod format;
 pub mod jupiter;
@@ -65,6 +65,7 @@ mod tests {
     use serde_json::json;
 
     /// mock RPC implementation for pure offline testing of the RpcSeam trait
+    #[allow(dead_code)]
     struct MockRpc;
 
     impl RpcSeam for MockRpc {
@@ -89,27 +90,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_accounting_engine_with_mock_rpc() {
-        let engine = AccountingEngine::new(MockRpc);
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-        let balance = engine.rpc.get_balance("test_addr").unwrap();
-        assert_eq!(balance, 1_000_000);
+        struct MockRpc;
 
-        let hash = engine.rpc.get_latest_blockhash().unwrap();
-        assert_eq!(hash, "4vJ9ju1bJJE96FWSXTmyv2C33f119x318NqA41A7JmyS");
-    }
+        impl RpcSeam for MockRpc {
+            fn get_balance(&self, _address: &str) -> Result<u64, String> {
+                Ok(1_500_000_000)
+            }
 
-    #[test]
-    fn test_quote_action_via_engine() {
-        let engine = AccountingEngine::new(MockRpc);
-        let args = brain::QuoteArgs {
-            sku: "SKU-SOL-100".to_string(),
-            quantity: 5,
-            now_unix: 1700000000,
-        };
+            fn get_latest_blockhash(&self) -> Result<String, String> {
+                Ok("MockBlockhash1111111111111111111111111111".to_string())
+            }
 
-        let result = brain::action_quote(&engine.rpc, &args).unwrap();
-        assert!(result.contains("SKU-SOL-100"));
+            fn get_transaction(&self, _sig: &str) -> Result<Value, String> {
+                Ok(serde_json::json!({}))
+            }
+        }
+
+        #[test]
+        fn test_accounting_engine_rpc_seam() {
+            let engine = AccountingEngine::new(MockRpc);
+            let balance = engine
+                .rpc
+                .get_balance("7Xw19aK4mQ2vB8pY3zN6jR5wL8kQ9tM4sP2vX1yZ3kL9")
+                .unwrap();
+            assert_eq!(balance, 1_500_000_000);
+
+            let blockhash = engine.rpc.get_latest_blockhash().unwrap();
+            assert!(blockhash.contains("MockBlockhash"));
+        }
     }
 }
