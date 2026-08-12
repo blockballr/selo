@@ -14,7 +14,9 @@ pub mod priority;
 pub mod ptax;
 pub mod quote;
 pub mod quotelog;
+pub mod refund;
 pub mod rpc;
+pub mod settle;
 pub mod simulate;
 pub mod solana_pay;
 pub mod store;
@@ -46,6 +48,14 @@ pub trait RpcSeam {
     }
 
     fn get_transaction(&self, sig: &str) -> Result<Value, String>;
+
+    /// Fetch a raw account, returned as the JSON-RPC `result` value. Used
+    /// by the durable-nonce anchor path to read a nonce account's stored
+    /// state. Defaults to an error so transports that never need it stay
+    /// tiny; the real HTTP transport overrides it.
+    fn get_account_info(&self, _address: &str) -> Result<Value, String> {
+        Err("this transport does not implement get_account_info".to_string())
+    }
 }
 
 /// the main entry point container pairing the engine logic with an RPC transport.

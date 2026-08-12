@@ -15,6 +15,8 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ledger::{EventKind, LedgerEvent};
 
 /// Which open lot a disposal consumes.
@@ -22,11 +24,12 @@ use crate::ledger::{EventKind, LedgerEvent};
 /// The declaration order is part of the sort key on disposal records,
 /// so reordering these variants changes the hash of any day that mixes
 /// books. Add new methods at the end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub enum LotMethod {
     /// Oldest acquisition first. The default assumption of most tax
     /// authorities and the only method that needs no election in many
     /// jurisdictions, which is why it is listed first here.
+    #[default]
     Fifo,
     /// Highest cost per unit first, which realizes the smallest gain
     /// available from the lots on hand. Legitimate where specific
@@ -86,7 +89,7 @@ impl LotMethod {
 /// exactly what this type exists to make impossible. The oracle variant
 /// cannot be built without naming its source and timestamp: a price with
 /// no source is a guess, and one with no timestamp cannot be checked.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum BasisEvidence {
     /// The cost is a difference between two integers the chain reported.
     /// A swap is the usual case: what was paid is on the other side of
@@ -128,7 +131,7 @@ impl BasisEvidence {
 /// book reports in, typically micro-USD, and never in the acquired
 /// asset's own units. Keeping the reporting currency implicit and
 /// integral means no line of this module ever divides by a rate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lot {
     /// Mint of the asset acquired, or `ledger::NATIVE_SOL_MINT` for
     /// lamports. Lots never pool across mints.
@@ -152,11 +155,25 @@ pub struct Lot {
     pub evidence: BasisEvidence,
 }
 
+/// A serializable snapshot of one open lot as the book holds it.
+///
+/// `quantity_base_units` and `cost_base_units` on the inner `Lot` are the
+/// REMAINING amounts (what the next disposal can reach), not the original
+/// acquisition. `seq` is the book's acceptance order, used only as a last
+/// resort tie-break and carried so a restored book sorts identically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenLotSnapshot {
+    pub lot: Lot,
+    pub remaining_quantity: u128,
+    pub remaining_cost: u128,
+    pub seq: u64,
+}
+
 /// A disposal as it arrives, before it has been matched against lots.
 ///
 /// This is the input side. The output is [`Disposal`], which is the
 /// reportable record and carries the basis this book supplied.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisposalEvent {
     /// Mint of the asset that left.
     pub mint: String,
@@ -178,7 +195,7 @@ pub struct DisposalEvent {
 /// Every field a reviewer needs is on the record itself rather than
 /// reachable through the book that produced it, because these records
 /// outlive the process that made them and get hashed on their own.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Disposal {
     pub mint: String,
     pub disposal_ref: String,
@@ -612,6 +629,64 @@ impl LotBook {
         }
         Ok(())
     }
+
+    /// Serialize the book's open lots and method for persistence.
+    ///
+    /// A ledger persists between runs, so a book whose acquisitions span
+    /// several ingest sessions must be restorable without re-reading the
+    /// chain. The snapshot is the entire state: the method (immutable),
+    /// the open lots with their remaining quantities and costs, the
+    /// acceptance sequence, and the last accepted event time.
+    pub fn snapshot(&self) -> BookSnapshot {
+        BookSnapshot {
+            method: self.method,
+            open_lots: self
+                .lots
+                .iter()
+                .map(|open| OpenLotSnapshot {
+                    lot: open.lot.clone(),
+                    remaining_quantity: open.remaining_quantity,
+                    remaining_cost: open.remaining_cost,
+                    seq: open.seq,
+                })
+                .collect(),
+            last_event_unix: self.last_event_unix,
+            next_seq: self.next_seq,
+        }
+    }
+
+    /// Restore a book from a snapshot, refusing anything a fresh book
+    /// would also refuse. A snapshot carries the method, so the caller
+    /// cannot quietly switch books mid-life.
+    pub fn from_snapshot(snapshot: BookSnapshot) -> Result<Self, String> {
+        let mut book = Self::new(snapshot.method);
+        for open in &snapshot.open_lots {
+            if open.remaining_quantity > open.lot.quantity_base_units {
+                return Err(format!(
+                    "snapshot lot {} has more remaining ({}) than it acquired ({})",
+                    open.lot.acquisition_ref, open.remaining_quantity, open.lot.quantity_base_units
+                ));
+            }
+            book.lots.push(OpenLot {
+                lot: open.lot.clone(),
+                remaining_quantity: open.remaining_quantity,
+                remaining_cost: open.remaining_cost,
+                seq: open.seq,
+            });
+        }
+        book.next_seq = snapshot.next_seq;
+        book.last_event_unix = snapshot.last_event_unix;
+        Ok(book)
+    }
+}
+
+/// A serializable snapshot of a [`LotBook`]'s full state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BookSnapshot {
+    pub method: LotMethod,
+    pub open_lots: Vec<OpenLotSnapshot>,
+    pub last_event_unix: Option<i64>,
+    pub next_seq: u64,
 }
 
 /// The indices of the open lots of one mint, in the order the method
@@ -1332,6 +1407,40 @@ mod tests {
         book.acquire(lot("buy-b", 1, 4, 1)).unwrap();
         let err = book.dispose(sale("sell-1", 2, 1, 1)).unwrap_err();
         assert!(err.contains("overflows"), "{err}");
+    }
+
+    #[test]
+    fn a_book_survives_a_snapshot_round_trip_byte_identically() {
+        let mut book = three_lots(LotMethod::Fifo);
+        book.dispose(sale("sell-1", 3, 1_000_000_000, 60_000_000))
+            .unwrap();
+
+        let snap = book.snapshot();
+        let restored = LotBook::from_snapshot(snap.clone()).unwrap();
+        assert_eq!(restored.snapshot(), snap);
+        assert_eq!(restored.method(), LotMethod::Fifo);
+        assert_eq!(restored.quantity_on_hand(NATIVE_SOL_MINT), 2_000_000_000);
+        assert_eq!(restored.cost_on_hand(NATIVE_SOL_MINT), 140_000_000);
+
+        // A restored book continues to book disposals identically.
+        let mut original = book;
+        let mut resumed = restored;
+        for _ in 0..4 {
+            let event = sale("sell-next", 4, 500_000_000, 40_000_000);
+            let a = original.dispose(event.clone()).unwrap();
+            let b = resumed.dispose(event).unwrap();
+            assert_eq!(lines(&a), lines(&b));
+        }
+        assert_eq!(original.snapshot(), resumed.snapshot());
+    }
+
+    #[test]
+    fn a_snapshot_with_a_lying_remaining_quantity_is_refused() {
+        let book = three_lots(LotMethod::Fifo);
+        let mut snap = book.snapshot();
+        snap.open_lots[0].remaining_quantity = snap.open_lots[0].lot.quantity_base_units + 1;
+        let err = LotBook::from_snapshot(snap).unwrap_err();
+        assert!(err.contains("more remaining"), "{err}");
     }
 
     #[test]

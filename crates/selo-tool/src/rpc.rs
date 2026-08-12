@@ -12,7 +12,7 @@ impl ToolRpc {
         }
     }
 
-    fn post(&self, payload: Value) -> Result<Value, String> {
+    pub fn post(&self, payload: Value) -> Result<Value, String> {
         let response = ureq::post(&self.rpc_url)
             .header("Content-Type", "application/json")
             .send_json(payload)
@@ -107,6 +107,21 @@ impl RpcSeam for ToolRpc {
                     "encoding": "jsonParsed",
                     "maxSupportedTransactionVersion": 0
                 }
+            ]
+        });
+
+        let res = self.post(payload)?;
+        Ok(res["result"].clone())
+    }
+
+    fn get_account_info(&self, address: &str) -> Result<Value, String> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [
+                address,
+                { "encoding": "base64" }
             ]
         });
 

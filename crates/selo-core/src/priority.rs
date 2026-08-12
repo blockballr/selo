@@ -88,7 +88,7 @@ impl FeeEstimate {
     pub fn total_lamports(&self) -> u64 {
         let total = (self.recommended_micro_lamports as u128)
             .saturating_mul(self.compute_units as u128);
-        ((total + 999_999) / 1_000_000) as u64
+        total.div_ceil(1_000_000) as u64
     }
 }
 

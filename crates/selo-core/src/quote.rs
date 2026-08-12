@@ -77,7 +77,7 @@ pub fn encode_amount(price_base_units: u64, tag: AmountTag) -> Result<u64, Strin
     if price_base_units == 0 {
         return Err("a quote for zero is not a sale".to_string());
     }
-    if price_base_units % TAG_SCALE != 0 {
+    if !price_base_units.is_multiple_of(TAG_SCALE) {
         return Err(format!(
             "price {price_base_units} is not a whole number of cents on this mint, so the \
              tag would overwrite part of the price; prices must be a multiple of {TAG_SCALE}"

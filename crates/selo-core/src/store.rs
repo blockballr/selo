@@ -133,16 +133,11 @@ impl SeloStore {
         false
     }
 
-    pub fn refund_quote(&mut self, id: &str, refund_signature: &str) -> bool {
+    pub fn refund_quote(&mut self, id: &str, refund_signature: &str, refunded_at: u64) -> bool {
         if let Some(quote) = self.quotes.iter_mut().find(|q| q.id == id) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
             quote.status = QuoteStatus::Refunded {
                 signature: refund_signature.to_string(),
-                refunded_at: now,
+                refunded_at,
             };
             return true;
         }

@@ -7,6 +7,7 @@
 use serde_json::{json, Value};
 
 use crate::address::{decode_pubkey, encode_pubkey, validate_pubkey};
+use crate::ledger::NATIVE_SOL_MINT;
 use crate::pda::associated_token_address;
 use crate::quote::{decode_amount, Quote};
 use crate::rpc::{parse_result_value, TOKEN_PROGRAM_ID};
@@ -409,6 +410,73 @@ fn token_deltas(meta: &Value, mint: &str) -> Result<Vec<TokenDelta>, String> {
         .collect())
 }
 
+/// Read the merchant's native-SOL balance change across the transaction.
+///
+/// Native SOL payments move lamports in the merchant's wallet account
+/// itself rather than in a token account, so there are no pre/post token
+/// balance entries to read. The wallet's position in the message's
+/// `accountKeys` indexes both `preBalances` and `postBalances`, and the
+/// difference is the net lamport change. Rent-exempt account creation or
+/// fee payments by the merchant would show up here as a negative delta,
+/// which is why only a positive rise counts as a receipt.
+fn sol_delta(result: &Value, meta: &Value, merchant: &str) -> Result<i128, String> {
+    let pre = meta
+        .get("preBalances")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "getTransaction meta missing preBalances".to_string())?;
+    let post = meta
+        .get("postBalances")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "getTransaction meta missing postBalances".to_string())?;
+    if pre.len() != post.len() {
+        return Err(format!(
+            "preBalances has {} entries but postBalances has {}",
+            pre.len(),
+            post.len()
+        ));
+    }
+
+    let mut index = None;
+    let mut keys_len = 0usize;
+    // The merchant wallet is one of the transaction's writable accounts.
+    // Its balance delta is the money that actually arrived.
+    if let Some(keys) = result
+        .pointer("/transaction/message/accountKeys")
+        .and_then(Value::as_array)
+    {
+        keys_len = keys.len();
+        for (i, key) in keys.iter().enumerate() {
+            let addr = key
+                .get("pubkey")
+                .and_then(Value::as_str)
+                .or_else(|| key.as_str());
+            if addr == Some(merchant) {
+                index = Some(i);
+                break;
+            }
+        }
+    }
+    let index = index.ok_or_else(|| {
+        format!("merchant {merchant} is not a writable account of this transaction")
+    })?;
+
+    if index >= pre.len() {
+        return Err(format!(
+            "accountKeys has {} entries but preBalances has {}; the balances are not indexed \
+             the same way",
+            keys_len,
+            pre.len()
+        ));
+    }
+    let pre_val = pre[index]
+        .as_u64()
+        .ok_or_else(|| format!("preBalances[{index}] is not a lamport amount"))?;
+    let post_val = post[index]
+        .as_u64()
+        .ok_or_else(|| format!("postBalances[{index}] is not a lamport amount"))?;
+    Ok(post_val as i128 - pre_val as i128)
+}
+
 /// Read a confirmed transaction and report what the merchant received.
 ///
 /// `Ok(None)` covers every "nothing for us here" case: no such
@@ -452,18 +520,29 @@ pub fn parse_settlement_payment(
         return Ok(None);
     }
 
-    let deltas = token_deltas(meta, &mint)?;
     let mut received: i128 = 0;
     let mut sources: Vec<String> = Vec::new();
-    for entry in &deltas {
-        if entry.owner == merchant {
-            // Summed rather than taking the first match, because a
-            // merchant may hold more than one account for a mint and an
-            // internal move between two of them nets to zero, which is
-            // the truthful answer.
-            received += entry.delta;
-        } else if entry.delta < 0 && !entry.owner.is_empty() {
-            sources.push(entry.owner.clone());
+
+    if mint == NATIVE_SOL_MINT {
+        // A native-SOL payment moves lamports in the wallet account itself.
+        received = sol_delta(&result, meta, &merchant)?;
+        if received < 0 {
+            // The merchant paid something out of its own SOL (fee or
+            // otherwise); that is a debit, not a receipt.
+            received = 0;
+        }
+    } else {
+        let deltas = token_deltas(meta, &mint)?;
+        for entry in &deltas {
+            if entry.owner == merchant {
+                // Summed rather than taking the first match, because a
+                // merchant may hold more than one account for a mint and an
+                // internal move between two of them nets to zero, which is
+                // the truthful answer.
+                received += entry.delta;
+            } else if entry.delta < 0 && !entry.owner.is_empty() {
+                sources.push(entry.owner.clone());
+            }
         }
     }
 
@@ -1452,5 +1531,98 @@ mod tests {
             None,
             "the exact amount, paid to the wrong address, is not a sale"
         );
+    }
+
+    #[test]
+    fn a_native_sol_payment_reads_the_wallet_lamport_delta() {
+        // A SOL settlement moves lamports in the merchant wallet itself.
+        // preBalances/postBalances are indexed by the accountKeys position,
+        // with the merchant wallet at index 3.
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "slot": 1u64,
+                "blockTime": NOW,
+                "meta": {
+                    "err": null,
+                    "fee": 5000,
+                    "preBalances": [1_000_000_000u64, 1_000_000u64, 1_000_000u64, 900_000_000u64, 1u64],
+                    "postBalances": [999_995_000u64, 1_000_000u64, 1_000_000u64, 950_000_000u64, 1u64]
+                },
+                "transaction": {"message": {"accountKeys": [
+                    {"pubkey": CUSTOMER},
+                    {"pubkey": "Mint"},
+                    {"pubkey": "SomeProgram"},
+                    {"pubkey": MERCHANT}
+                ]}}
+            }
+        })
+        .to_string();
+        let payment = parse_settlement_payment(&sig(1), MERCHANT, NATIVE_SOL_MINT, &body)
+            .unwrap()
+            .expect("a SOL rise must be read as a payment");
+        assert_eq!(payment.amount_base_units, 50_000_000);
+        assert_eq!(payment.mint, NATIVE_SOL_MINT);
+    }
+
+    #[test]
+    fn a_native_sol_outflow_is_not_a_payment() {
+        // The merchant's SOL fell (it paid a fee or funded something), so
+        // nothing was received even though the wallet is in the keys.
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "slot": 1u64,
+                "blockTime": NOW,
+                "meta": {
+                    "err": null,
+                    "fee": 5000,
+                    "preBalances": [1_000_000_000u64, 950_000_000u64, 1u64],
+                    "postBalances": [999_995_000u64, 945_000_000u64, 1u64]
+                },
+                "transaction": {"message": {"accountKeys": [
+                    {"pubkey": CUSTOMER},
+                    {"pubkey": MERCHANT},
+                    {"pubkey": "Mint"}
+                ]}}
+            }
+        })
+        .to_string();
+        assert_eq!(
+            parse_settlement_payment(&sig(1), MERCHANT, NATIVE_SOL_MINT, &body).unwrap(),
+            None,
+            "a falling balance is a debit, not a receipt"
+        );
+    }
+
+    #[test]
+    fn a_native_sol_payment_without_the_merchant_in_keys_is_not_attributed() {
+        // The merchant is not an account of this transaction, so its
+        // balance cannot have changed here. The absence is an error at the
+        // parser level (a config mistake), not a silent None.
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "slot": 1u64,
+                "blockTime": NOW,
+                "meta": {
+                    "err": null,
+                    "fee": 5000,
+                    "preBalances": [1_000_000_000u64, 1u64],
+                    "postBalances": [999_995_000u64, 1u64]
+                },
+                "transaction": {"message": {"accountKeys": [
+                    {"pubkey": CUSTOMER},
+                    {"pubkey": "Mint"}
+                ]}}
+            }
+        })
+        .to_string();
+        let err =
+            parse_settlement_payment(&sig(1), MERCHANT, NATIVE_SOL_MINT, &body).unwrap_err();
+        assert!(err.contains("not a writable account"), "{err}");
     }
 }

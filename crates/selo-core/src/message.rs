@@ -56,56 +56,6 @@ impl AccountMeta {
     }
 }
 
-pub struct TokenTransferParams {
-    pub sender: [u8; 32],
-    pub recipient: [u8; 32],
-    pub mint: [u8; 32],
-    pub amount: u64,
-    pub blockhash: [u8; 32],
-}
-
-/// build an SPL token transfer message.
-pub fn build_token_transfer_message(params: &TokenTransferParams) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(200);
-
-    // Header: 1 signature, 0 readonly signed, 1 readonly unsigned
-    msg.extend_from_slice(&[1, 0, 1]);
-
-    // account keys: sender, recipient, mint, token program, system program
-    let keys = vec![
-        params.sender,
-        params.recipient,
-        params.mint,
-        [
-            208, 197, 190, 11, 155, 29, 153, 138, 170, 9, 204, 18, 178, 203, 11, 137, 7, 241, 163,
-            169, 193, 170, 75, 149, 103, 17, 208, 12, 0, 0, 0, 0,
-        ], // SPL Token Program ID approx stub
-        [0u8; 32], // system program
-    ];
-
-    msg.extend_from_slice(&shortvec(keys.len()));
-    for key in &keys {
-        msg.extend_from_slice(key);
-    }
-
-    msg.extend_from_slice(&params.blockhash);
-
-    // Instruction data for transfer checked / transfer
-    let mut data = Vec::with_capacity(9);
-    data.push(3); // Transfer instruction discriminant
-    data.extend_from_slice(&params.amount.to_le_bytes());
-
-    // Single instruction referencing accounts
-    msg.extend_from_slice(&shortvec(1));
-    msg.push(3); // Program index
-    msg.extend_from_slice(&shortvec(2));
-    msg.extend_from_slice(&[0, 1]); // accounts [sender, recipient]
-    msg.extend_from_slice(&shortvec(data.len()));
-    msg.extend_from_slice(&data);
-
-    msg
-}
-
 pub struct VtxMessage {
     pub header: [u8; 3],
     pub account_keys: Vec<[u8; 32]>,

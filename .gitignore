@@ -8,7 +8,6 @@
 .selo_ledger.json
 /dist
 Cargo.lock.bak
-Cargo.lock
 *.log
 brand/
 notes/

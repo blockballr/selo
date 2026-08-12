@@ -1,0 +1,29 @@
+# Selo Telegram Adapter — committed defaults.
+# Secrets live in .env (already gitignored). Per-machine overrides go in
+# config.local.toml (also gitignored via *.local.toml rule).
+
+[selo]
+# Directory where selo-tool runs (state files land here).
+data_dir = "adapters/telegram/data"
+
+[merchant]
+# Default merchant pubkey used by scheduled close and issue SOPs.
+pubkey = ""
+# Fiscal year for report generation.
+year = "2026"
+# Timezone for cron schedules (IANA tz name).
+timezone = "America/Sao_Paulo"
+
+[schedule]
+# Daily close at 23:00 local time.
+close = "0 23 * * *"
+# Settlement reconciliation interval in seconds.
+reconciliation_interval_secs = 60
+# Hourly store-health ping.
+health = "0 * * * *"
+# Monthly full reconciliation on the 1st at 06:00.
+monthly_reconciliation = "0 6 1 * *"
+
+[alerts]
+# Settlement confirmations push to all alert chat IDs.
+# Set TELEGRAM_ALERTS_TO in .env (comma-separated chat IDs).

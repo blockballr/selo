@@ -1,0 +1,47 @@
+# ZeroClaw Selo Integration
+#
+# Selo runs two channel surfaces through ZeroClaw:
+#
+# 1. Telegram (primary operations harness)
+#    The adapter at adapters/telegram/main.py owns scheduling (daily close,
+#    settlement reconciliation, health checks), SOP-driven workflows, and the
+#    settlement watcher. ZeroClaw launches it as a long-running channel adapter.
+#    It does its own long-polling -- no webhook needed.
+#
+# 2. WhatsApp (webhook bridge)
+#    WhatsApp messages arrive via Meta Cloud API webhook. ZeroClaw's built-in
+#    webhook server dispatches them to the selo skill, which maps natural
+#    language to selo-tool subcommands. Requires a public webhook URL and a
+#    Meta Business account.
+
+[agent]
+name = "SeloAccountingBot"
+description = "Cryptographic accounting agent for Solana payment intent, settlement reconciliation, and daily close anchoring"
+
+[skills]
+path = "skills"
+
+# ---- Webhook triggers (WhatsApp) ----
+# Telegram uses long-polling, not a webhook. Only WhatsApp is webhook-driven.
+
+[triggers.webhook.whatsapp]
+path = "/webhook/whatsapp"
+skill = "selo"
+action = "dispatch"
+
+# ---- Channels ----
+
+[channels.telegram]
+enabled = true
+adapter_script = "adapters/telegram/main.py"
+description = "Primary operational harness: commands, cron scheduling, SOP workflows, settlement alerts"
+
+[channels.whatsapp]
+enabled = true
+provider = "meta"
+webhook_verify_token = "selo_secure_verify_token"
+description = "WhatsApp bridge via Meta Cloud API webhook"
+
+# ---- Settlement RPC (read by selo-tool via SOLANA_RPC_URL env var) ----
+# The adapter and selo-tool both pick up HELIUS_API_KEY and SOLANA_RPC_URL
+# from the environment automatically.

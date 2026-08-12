@@ -8,6 +8,29 @@ use std::collections::HashMap;
 /// Standard native SOL mint address on Solana.
 pub const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+/// Map a mint address to the human-readable symbol used in reports and the
+/// tax book. Unknown mints resolve to "TOKEN". Mirrors the tool's own table
+/// so the core projection and the CLI can never disagree.
+pub fn mint_to_symbol(mint: &str) -> &'static str {
+    match mint {
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => "USDC",
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => "USDT",
+        "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo" => "PYUSD",
+        "2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH" => "USDG",
+        m if m.starts_with("So111") || m == NATIVE_SOL_MINT => "SOL",
+        _ => "TOKEN",
+    }
+}
+
+/// Decimals for a symbol. SOL is 9, every tracked stablecoin is 6, and
+/// unknown tokens default to 6. Mirrors the tool's own table.
+pub fn decimals_for_symbol(symbol: &str) -> u32 {
+    match symbol {
+        "SOL" => 9,
+        _ => 6,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LedgerEvent {
     pub block_time_unix: Option<i64>,
@@ -50,6 +73,12 @@ impl EventKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CounterpartyRegistry {
     pub rules: HashMap<String, String>,
+}
+
+impl Default for CounterpartyRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CounterpartyRegistry {
@@ -278,10 +307,10 @@ impl<'a, T: RpcSeam> Backfiller<'a, T> {
 }
 
 fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
-fn parse_date_to_timestamp(date_str: &str) -> Option<i64> {
+pub fn parse_date_to_timestamp(date_str: &str) -> Option<i64> {
     let trimmed = date_str.trim();
     if trimmed.is_empty() {
         return None;
@@ -301,7 +330,7 @@ fn parse_date_to_timestamp(date_str: &str) -> Option<i64> {
         _ => return None,
     };
 
-    if year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 {
+    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
 
@@ -425,7 +454,7 @@ pub fn parse_transaction_events(
     };
 
     // Allowed asset mints: SOL, USDC, USDT, PYUSD/USDG
-    let allowed_mints = vec![
+    let allowed_mints = [
         NATIVE_SOL_MINT,
         "So11111111111111111111111111111111111111112",
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC

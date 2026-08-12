@@ -10,11 +10,18 @@
 use sha2::{Digest, Sha256};
 
 use crate::address::{decode_pubkey, validate_pubkey};
-use crate::message::{compile_message, Instruction};
+use crate::message::{compile_message, AccountMeta, Instruction};
+use crate::nonce::NonceState;
 use crate::quote::AmountTag;
 use crate::quotelog::QuoteEntry;
 use crate::tx::validate_signature;
 use crate::zk::hash_pair;
+
+/// Solana system program, used for AdvanceNonceAccount instructions.
+pub const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
+
+/// Solana recent blockhashes sysvar, required by AdvanceNonceAccount.
+pub const RECENT_BLOCKHASHES_SYSVAR: &str = "SysvarRecentB1ockHashes11111111111111111111";
 
 /// A confirmed sale on-chain, matched to a daily close line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,7 +179,11 @@ pub struct PreparedAnchor {
     pub memo: String,
     pub commitment: [u8; 32],
     pub merchant: String,
+    /// The blockhash (or durable nonce value) used in the message.
     pub blockhash: String,
+    /// When set, the anchor was built with a durable nonce and the
+    /// transaction includes an AdvanceNonceAccount instruction.
+    pub durable_nonce_account: Option<String>,
 }
 
 pub fn build_close(
@@ -237,6 +248,7 @@ pub fn build_close(
 pub fn prepare_anchor(
     close: &DailyClose,
     recent_blockhash: &str,
+    durable_nonce: Option<&NonceState>,
 ) -> Result<PreparedAnchor, String> {
     let merchant = decode_pubkey(&close.merchant)
         .map_err(|e| format!("merchant address is not a valid Solana address: {e}"))?;
@@ -251,22 +263,65 @@ pub fn prepare_anchor(
         ));
     }
 
-    let message = compile_message(
-        &merchant,
-        &[Instruction {
-            program_id: memo_program,
-            accounts: vec![crate::message::AccountMeta::signer_writable(merchant)],
-            data: memo.as_bytes().to_vec(),
-        }],
-        recent_blockhash,
-    )?;
+    let (blockhash_for_msg, instructions, durable_nonce_account) =
+        if let Some(nonce) = durable_nonce {
+            let nonce_account = decode_pubkey(&nonce.nonce_address).map_err(|e| {
+                format!("durable nonce account is not a valid Solana address: {e}")
+            })?;
+            let nonce_authority = decode_pubkey(&nonce.authority).map_err(|e| {
+                format!("durable nonce authority is not a valid Solana address: {e}")
+            })?;
+            let system_program = decode_pubkey(SYSTEM_PROGRAM_ID)
+                .map_err(|_| "system program id is not valid base58".to_string())?;
+            let blockhashes_sysvar = decode_pubkey(RECENT_BLOCKHASHES_SYSVAR)
+                .map_err(|_| "recent blockhashes sysvar is not valid base58".to_string())?;
+
+            // AdvanceNonceAccount discriminant is 4 (u32 LE).
+            let advance_data = vec![4, 0, 0, 0];
+
+            let advance_ix = Instruction {
+                program_id: system_program,
+                accounts: vec![
+                    AccountMeta::writable(nonce_account),
+                    AccountMeta::readonly(blockhashes_sysvar),
+                    AccountMeta::signer_readonly(nonce_authority),
+                ],
+                data: advance_data,
+            };
+
+            let memo_ix = Instruction {
+                program_id: memo_program,
+                accounts: vec![AccountMeta::signer_writable(merchant)],
+                data: memo.as_bytes().to_vec(),
+            };
+
+            (
+                nonce.current_nonce.clone(),
+                vec![advance_ix, memo_ix],
+                Some(nonce.nonce_address.clone()),
+            )
+        } else {
+            let memo_ix = Instruction {
+                program_id: memo_program,
+                accounts: vec![AccountMeta::signer_writable(merchant)],
+                data: memo.as_bytes().to_vec(),
+            };
+            (
+                recent_blockhash.trim().to_string(),
+                vec![memo_ix],
+                None,
+            )
+        };
+
+    let message = compile_message(&merchant, &instructions, &blockhash_for_msg)?;
 
     Ok(PreparedAnchor {
         message,
         memo,
         commitment: close.commitment,
         merchant: close.merchant.clone(),
-        blockhash: recent_blockhash.trim().to_string(),
+        blockhash: blockhash_for_msg,
+        durable_nonce_account,
     })
 }
 
@@ -473,6 +528,7 @@ fn line_for(
     })
 }
 
+#[allow(dead_code)]
 #[cfg(test)]
 mod tests {
     use super::*;
