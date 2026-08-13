@@ -130,6 +130,14 @@ pub struct TaxLedger {
     /// makes reconcile deterministic and offline after the first ingest.
     #[serde(default)]
     pub rates: BTreeMap<String, f64>,
+    /// Policy: treat outbound transfers to a counterparty (an Expense with
+    /// no same-transaction Income, i.e. a payment rather than a swap) as an
+    /// operating expense instead of a capital disposal. The position is
+    /// still reduced, but no capital loss is booked and nothing appears in
+    /// the gains report. Defaults to false, which keeps the historical
+    /// behavior of booking the full cost basis as a realized loss.
+    #[serde(default)]
+    pub payments_as_expenses: bool,
 }
 
 impl TaxLedger {
@@ -146,6 +154,7 @@ impl TaxLedger {
             disposals: Vec::new(),
             events: Vec::new(),
             rates: BTreeMap::new(),
+            payments_as_expenses: false,
         }
     }
 
@@ -203,16 +212,17 @@ impl TaxLedger {
             oracle_cost,
         };
         use crate::ledger::{decimals_for_symbol, mint_to_symbol, EventKind};
-        use crate::ptax::unix_to_ymd;
+        use crate::ptax::{unix_to_ymd, DEFAULT_HISTORICAL_PTAX};
         use std::collections::HashMap;
 
         const MICRO_PER_BRL: f64 = 1_000_000.0;
 
-        // Rates are memoized on the ledger, keyed by purpose so a cost
-        // basis and a PTAX conversion never collide. First ingest resolves
-        // from the live feed and stores; every later rebuild replays the
-        // stored value, which is what makes the whole book deterministic
-        // and offline after the first pass.
+        // A rate that is missing, zero, or not a number would silently
+        // erase cost basis (everything multiplies by it). Stored values are
+        // trusted only when finite and positive; anything else is treated
+        // as a miss and re-resolved, and whatever is stored must be finite
+        // and positive. The floor is the documented historical PTAX, so a
+        // missing weekday rate never becomes a 0 that poisons the book.
         let cost_of = |rates: &mut BTreeMap<String, f64>,
                            symbol: &str,
                            ymd: &str,
@@ -220,9 +230,12 @@ impl TaxLedger {
          -> f64 {
             let key = format!("{symbol}|{ymd}");
             if let Some(v) = rates.get(&key) {
-                return *v;
+                if v.is_finite() && *v > 0.0 {
+                    return *v;
+                }
             }
             let v = live();
+            let v = if v.is_finite() && v > 0.0 { v } else { DEFAULT_HISTORICAL_PTAX };
             rates.insert(key, v);
             v
         };
@@ -232,9 +245,12 @@ impl TaxLedger {
          -> f64 {
             let key = format!("ptax|{ymd}");
             if let Some(v) = rates.get(&key) {
-                return *v;
+                if v.is_finite() && *v > 0.0 {
+                    return *v;
+                }
             }
             let v = live();
+            let v = if v.is_finite() && v > 0.0 { v } else { DEFAULT_HISTORICAL_PTAX };
             rates.insert(key, v);
             v
         };
@@ -398,7 +414,16 @@ impl TaxLedger {
                         quantity_base_units: ev.amount_base_units as u128,
                         proceeds_base_units: proceeds_micro,
                     })?;
-                    self.disposals.extend(records);
+                    if self.payments_as_expenses && proceeds_micro == 0 {
+                        // Policy: a payment to a counterparty is an
+                        // operating expense, not a capital disposal. The
+                        // position is still reduced by the dispose above so
+                        // the book stays honest, but no disposal record and
+                        // no gain/loss is booked, and nothing reaches the
+                        // gains report or the tax calculation.
+                    } else {
+                        self.disposals.extend(records);
+                    }
                 }
                 _ => {}
             }
@@ -769,5 +794,159 @@ mod tests {
         assert_eq!(first_gain, second_gain, "rate change must not move the ledger");
         // All three rates were resolved on the first pass and reused after.
         assert_eq!(ledger.rates.len(), 3, "no new rates resolved on the replay");
+    }
+
+    #[test]
+    fn a_zero_or_missing_rate_falls_back_to_the_historical_ptax() {
+        use crate::ledger::{EventKind, LedgerEvent};
+        use crate::ptax::DEFAULT_HISTORICAL_PTAX;
+
+        // A ledger with a corrupted stored rate (0, from a bad manual edit
+        // or a broken feed) must not multiply cost basis by zero. The stored
+        // value is treated as a miss, the live closure is consulted, and
+        // even a dead live closure floors at the historical PTAX constant.
+        let mut ledger = TaxLedger::new();
+        ledger.rates.insert("SOL|2023-11-14".to_string(), 0.0);
+        ledger.rates.insert("ptax|2023-11-14".to_string(), 0.0);
+
+        ledger.record_event(LedgerEvent {
+            block_time_unix: Some(1_700_000_000),
+            kind: EventKind::Income,
+            amount_base_units: 1_000_000_000, // 1 SOL
+            mint: crate::ledger::NATIVE_SOL_MINT.to_string(),
+            counterparty: None,
+            counterparty_address: None,
+            signature: "sig-in".to_string(),
+            is_classified: true,
+        });
+        // An expense on the same day exercises the ptax repair path too:
+        // the disposal projection reads ptax|date to render the USD columns.
+        ledger.record_event(LedgerEvent {
+            block_time_unix: Some(1_700_086_400),
+            kind: EventKind::Expense,
+            amount_base_units: 500_000_000, // 0.5 SOL
+            mint: crate::ledger::NATIVE_SOL_MINT.to_string(),
+            counterparty: None,
+            counterparty_address: None,
+            signature: "sig-out".to_string(),
+            is_classified: true,
+        });
+
+        // A live source that is itself broken returns 0 too; the floor must
+        // still save the book from a zero basis.
+        let dead = |_s: &str, _y: &str| 0.0f64;
+        let dead_ptax = |_y: &str| 0.0f64;
+        ledger.reconcile(&dead, &dead_ptax).unwrap();
+
+        // The lot exists with a positive cost, and the persisted rate was
+        // repaired to the fallback rather than left at zero.
+        assert_eq!(ledger.lots.len(), 1, "a zero rate must not drop the lot");
+        assert!(
+            ledger.lots[0].unit_cost_basis_brl > 0.0,
+            "cost basis must be positive, got {}",
+            ledger.lots[0].unit_cost_basis_brl
+        );
+        assert!(
+            *ledger.rates.get("ptax|2023-11-14").unwrap() >= DEFAULT_HISTORICAL_PTAX,
+            "ptax must not be stored as zero"
+        );
+        assert!(
+            *ledger.rates.get("SOL|2023-11-14").unwrap() >= DEFAULT_HISTORICAL_PTAX,
+            "cost basis rate must not be stored as zero"
+        );
+    }
+
+    #[test]
+    fn payments_as_expenses_books_no_capital_loss() {
+        use crate::ledger::{EventKind, LedgerEvent};
+
+        let mut ledger = TaxLedger::new();
+        ledger.payments_as_expenses = true;
+        // Income of 1 USDC, then a payment of 1 USDC to a counterparty with
+        // no same-transaction income (a pure payment, not a swap).
+        let inc = LedgerEvent {
+            block_time_unix: Some(1_700_000_000),
+            kind: EventKind::Income,
+            amount_base_units: 1_000_000,
+            mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            counterparty: Some("Client".to_string()),
+            counterparty_address: None,
+            signature: "sig-in".to_string(),
+            is_classified: true,
+        };
+        let pay = LedgerEvent {
+            block_time_unix: Some(1_700_086_400),
+            kind: EventKind::Expense,
+            amount_base_units: 1_000_000,
+            mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            counterparty: Some("Vendor".to_string()),
+            counterparty_address: None,
+            signature: "sig-pay".to_string(),
+            is_classified: true,
+        };
+        ledger.record_event(inc);
+        ledger.record_event(pay);
+        let rate = |_s: &str, _y: &str| 5.5f64;
+        let ptax = |_y: &str| 5.5f64;
+        ledger.reconcile(&rate, &ptax).unwrap();
+
+        // No capital disposal and no gain record: the payment is an expense.
+        assert_eq!(ledger.disposals.len(), 0, "no disposal for an expense");
+        assert_eq!(ledger.gain_records.len(), 0, "no capital loss booked");
+        // The position was still reduced: the income lot is consumed.
+        assert_eq!(
+            ledger
+                .book
+                .open_lots
+                .iter()
+                .map(|o| o.remaining_quantity)
+                .sum::<u128>(),
+            0,
+            "the payment still consumes the position"
+        );
+        assert!(ledger.lots.is_empty(), "no open lots after the payment");
+    }
+
+    #[test]
+    fn payments_as_expenses_keeps_swaps_as_capital_disposals() {
+        use crate::ledger::{EventKind, LedgerEvent};
+
+        let mut ledger = TaxLedger::new();
+        ledger.payments_as_expenses = true;
+        // A swap: pay out 1 SOL, receive 10 USDC in the same signature.
+        let expense = LedgerEvent {
+            block_time_unix: Some(1_700_000_000),
+            kind: EventKind::Expense,
+            amount_base_units: 1_000_000_000,
+            mint: crate::ledger::NATIVE_SOL_MINT.to_string(),
+            counterparty: Some("Jupiter".to_string()),
+            counterparty_address: None,
+            signature: "sig-swap".to_string(),
+            is_classified: true,
+        };
+        let income = LedgerEvent {
+            block_time_unix: Some(1_700_000_000),
+            kind: EventKind::Income,
+            amount_base_units: 10_000_000,
+            mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            counterparty: Some("Jupiter".to_string()),
+            counterparty_address: None,
+            signature: "sig-swap".to_string(),
+            is_classified: true,
+        };
+        // SOL was funded externally, so an opening-balance lot covers the
+        // swap's expense side.
+        ledger.record_event(expense);
+        ledger.record_event(income);
+        let rate = |sym: &str, _y: &str| {
+            if sym == "SOL" { 100.0 } else { 5.5 }
+        };
+        let ptax = |_y: &str| 5.5f64;
+        ledger.reconcile(&rate, &ptax).unwrap();
+
+        // The swap is a capital disposal even under the policy.
+        assert_eq!(ledger.disposals.len(), 1, "swap still books a disposal");
+        assert_eq!(ledger.gain_records.len(), 1, "swap still books a gain/loss");
+        assert!(ledger.gain_records[0].is_swap, "recorded as a swap");
     }
 }

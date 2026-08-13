@@ -108,6 +108,18 @@ the oldest acquisition is always consumed first regardless of arrival order.
 Resolved PTAX and SOL/USD rates are persisted alongside the events, so a live
 feed that succeeds today and is rate-limited tomorrow cannot quietly change
 the ledger; the book is deterministic and offline after the first ingest.
+A stored rate that is missing or zero is treated as a miss and re-resolved,
+and every rate is floored at the documented historical PTAX, so a broken
+feed can never multiply cost basis by zero.
+
+By default every outbound transfer to a classified counterparty is booked as
+a capital disposal, and a payment with no same-transaction income realizes a
+full loss. Run `selo-tool ingest <pubkey> --all --payments-as-expenses` to
+adopt the alternative policy: payments to counterparties are treated as
+operating expenses. The position is still reduced, but no capital loss is
+booked and nothing reaches the gains report or the tax calculation. Only
+swaps (an expense with income in the same transaction) remain capital
+disposals. The choice is persisted on the ledger.
 
 ### Master Roadmap and Phases
 

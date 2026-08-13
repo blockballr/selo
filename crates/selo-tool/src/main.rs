@@ -141,6 +141,11 @@ enum Commands {
         before: Option<String>,
         #[arg(long, help = "Ingest complete transaction history")]
         all: bool,
+        #[arg(
+            long,
+            help = "Treat outbound transfers to counterparties (payments, not swaps) as operating expenses: reduce the position but book no capital loss and report nothing"
+        )]
+        payments_as_expenses: bool,
     },
     /// surface unclassified counterparties needing review from ingested ledger data
     #[command(
@@ -1009,9 +1014,15 @@ fn main() -> Result<(), String> {
             since,
             before,
             all,
+            payments_as_expenses,
         } => {
             let resolved_addr = resolve_address(&address, &rules);
             let entity_label = rules.get_name(&resolved_addr);
+            if payments_as_expenses {
+                println!(
+                    "Policy: outbound transfers to counterparties will be treated as expenses (no capital loss booked)."
+                );
+            }
             println!(
                 "Ingesting & categorizing transaction history for: {} [{}]",
                 resolved_addr, entity_label
@@ -1030,6 +1041,13 @@ fn main() -> Result<(), String> {
             );
 
             let mut multi_ledger = load_multi_ledger(&resolved_addr);
+            if payments_as_expenses {
+                // Persist the policy so reconcile applies it on every
+                // rebuild, not just this run.
+                multi_ledger
+                    .get_mut_ledger(&resolved_addr)
+                    .payments_as_expenses = true;
+            }
             let processed: std::collections::BTreeSet<String> = {
                 let ledger = multi_ledger.get_mut_ledger(&resolved_addr);
                 ledger.processed_signatures.clone()
