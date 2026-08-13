@@ -628,7 +628,11 @@ impl TaxLedger {
         }
 
         let small_mark_open = r#"<svg width="17" height="17" viewBox="0 0 128 128" style="display:inline-block; vertical-align:middle; opacity:.45;" role="img" aria-label="Open"><defs><clipPath id="s-open"><circle cx="64" cy="64" r="50"/></clipPath></defs><g clip-path="url(#s-open)"><path d="M64 0H128V128H64Z" fill="currentColor"/></g><circle cx="64" cy="64" r="50" fill="none" stroke="currentColor" stroke-width="13"/></svg>"#;
-        let small_mark_sealed = r#"<svg width="17" height="17" viewBox="0 0 128 128" style="display:inline-block; vertical-align:middle; color:var(--wax);" role="img" aria-label="Sealed"><defs><clipPath id="s-seal"><circle cx="64" cy="64" r="50"/></clipPath></defs><g clip-path="url(#s-seal)"><path d="M64 0H128V128H64Z" fill="currentColor"/></g><circle cx="64" cy="64" r="50" fill="none" stroke="currentColor" stroke-width="13"/></svg>"#;
+        // The sealed mark is the seal fully closed: a solid disc in the
+        // sealing-wax red, with no split and no ruling. Open periods show
+        // the split mark; a closed period shows that the two halves have
+        // come together.
+        let small_mark_sealed = r#"<svg width="17" height="17" viewBox="0 0 128 128" style="display:inline-block; vertical-align:middle; color:var(--wax-badge);" role="img" aria-label="Sealed"><circle cx="64" cy="64" r="52" fill="currentColor"/></svg>"#;
 
         let mut cumulative_ledger_cost = 0.0;
         let mut cumulative_ledger_receipts = 0;
@@ -912,7 +916,7 @@ impl TaxLedger {
                                 <div style="display:flex; align-items:center; gap:14px;">
                                     <span style="font:600 14px/1.3 var(--selo-font-mono);">Net {net_sign}R$ {net:.2}</span>
                                     <span style="font:600 12px/1.3 var(--selo-font-mono);color:var(--selo-muted);">{net_usd_sign}${net_usd:.2}</span>
-                                    <span style="padding:2px 10px;background:var(--wax);border-radius:4px;font:600 14px/1.3 var(--selo-font-mono);color:#fff;">Tax Due R$ {tax:.2}<span style="font-weight:400;margin-left:4px;">${tax_usd:.2}</span></span>
+                                    <span style="padding:2px 10px;background:var(--wax-badge);border-radius:4px;font:600 14px/1.3 var(--selo-font-mono);color:#fff;">Tax Due R$ {tax:.2}<span style="font-weight:400;margin-left:4px;">${tax_usd:.2}</span></span>
                                 </div>
                             </div>
                             {tax_note}
@@ -1052,6 +1056,7 @@ impl TaxLedger {
     --selo-rule: #DED5C9;
     --selo-raised: #FFFFFF;
     --wax: #B4381F;
+    --wax-badge: #B4381F;
     --green: #1A7D3A;
     --selo-font-sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
     --selo-font-mono: ui-monospace, "JetBrains Mono", Consolas, monospace;
@@ -1064,6 +1069,7 @@ impl TaxLedger {
       --selo-rule: #2E2A25;
       --selo-raised: #1D1A16;
       --wax: #F2EDE5;
+      --wax-badge: #B4381F;
       --green: #3FB950;
     }}
   }}
@@ -1223,11 +1229,26 @@ impl TaxLedger {
     }}
 
     function copyToClipboard(text, btn) {{
-      navigator.clipboard.writeText(text).then(function() {{
+      function done() {{
         var orig = btn.textContent;
         btn.textContent = 'Copied ✓';
         setTimeout(function() {{ btn.textContent = orig; }}, 2000);
-      }});
+      }}
+      function fallback() {{
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try {{ document.execCommand('copy'); done(); }} catch (e) {{ btn.textContent = 'Copy failed'; }}
+        document.body.removeChild(ta);
+      }}
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        navigator.clipboard.writeText(text).then(done).catch(fallback);
+      }} else {{
+        fallback();
+      }}
     }}
 
     // Compute SHA-256 over the embedded lot data and compare.
@@ -1600,9 +1621,12 @@ impl TaxLedger {
   }}
 
   // Self-test: pins poseidon4 to vectors produced by the Rust implementation.
+  // The Rust side emits fixed-width 64-hex-char strings; BigInt.toString(16)
+  // strips leading zeroes, so both sides are padded before comparing.
   const POSEIDON_SELF_TEST_OK = (function () {{
-    const v1 = poseidon4([0n, 5000000n, 50500n]).toString(16);
-    const v2 = poseidon4([1n, 2n, 3n]).toString(16);
+    const hex64 = function (v) {{ return v.toString(16).padStart(64, '0'); }};
+    const v1 = hex64(poseidon4([0n, 5000000n, 50500n]));
+    const v2 = hex64(poseidon4([1n, 2n, 3n]));
     return v1 === '2f965d1a1ad15eb3351f8e772d681e6287754eb759d579193896e93e219c8bf8'
         && v2 === '0e7732d89e6939c0ff03d5e58dab6302f3230e269dc5b968f725df34ab36d732';
   }})();
