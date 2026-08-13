@@ -231,23 +231,34 @@ ingest.
 
 ### ZeroClaw Integration
 
-Selo runs two channel surfaces through ZeroClaw, configured in `zeroclaw.toml`:
+Selo runs through ZeroClaw 0.8.4 as the `selo` agent with the `selo` skill
+(see `zeroclaw.toml` for the canonical wiring and `skills/selo/SKILL.md` for
+the skill definition). The agent's model brain interprets messages and
+invokes the selo-tool release binary, which owns the money path.
 
-**Telegram (primary operations harness).** The adapter at
-`adapters/telegram/main.py` is the main control surface. It provides command
-routing with admin gating, built-in cron scheduling (daily close at 23:00,
-hourly health checks, monthly reconciliation), a settlement watcher with
-signature deduplication, confirm-token gates for destructive operations, and
-progress streaming for long-running ingest commands. It uses Telegram
-long-polling -- no webhook or public URL required. Scheduling is owned by the
-adapter, not by ZeroClaw's cron engine.
+The security model is enforced in two layers. First, the agent runs under a
+narrow risk profile (`selo-safe`): it may only run `selo-tool`, and only the
+read/query/close-prep subcommands. The money-moving and mutation commands
+(`issue`, `refund`, `expire`) are excluded from the agent entirely and stay
+human-only behind confirm-token gates. Second, selo-tool itself never signs:
+a daily close or anchor produces an unsigned transaction that requires the
+human T1 signature before broadcast, so prompt injection cannot reach a
+destination-changing command or a private key.
 
-**WhatsApp (webhook bridge).** WhatsApp messages arrive via Meta Cloud API
-webhook. ZeroClaw's built-in webhook server dispatches them to the selo skill
-(`skills/selo/SKILL.toml`), which maps natural language to selo-tool
-subcommands. Requires a Meta Business account and a public webhook URL.
+**Telegram (primary surface).** The Telegram channel is enabled and bound to
+the agent. The standalone adapter at `adapters/telegram/main.py` remains the
+deterministic operations harness (admin gating, cron scheduling, settlement
+watcher, confirm-token gates, progress streaming) and is LLM-free by design;
+it is an alternative to the agent for operators who want no model in the
+control path.
 
-Full setup instructions for both channels are in `adapters/README.md`.
+**WhatsApp (webhook bridge).** Configured via the `selo` skill. Note that
+the stock ZeroClaw 0.8.4 binary does not compile in the WhatsApp channel; a
+source build with the WhatsApp channel feature is required.
+
+Live credentials (bot token, Gemini API key) are encrypted secrets in
+`~/.zeroclaw/config.toml`, set via masked input, never in version control.
+Full setup instructions are in `adapters/README.md`.
 
 ### License
 
