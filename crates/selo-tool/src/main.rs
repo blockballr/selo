@@ -15,6 +15,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Process-local counter so two quotes issued in the same millisecond still
@@ -29,6 +30,41 @@ use rpc::ToolRpc;
 const STORE_FILE: &str = ".selo_store.json";
 const RULES_FILE: &str = ".selo_rules.json";
 const LEDGER_FILE_PREFIX: &str = ".selo_ledger_";
+const MERCHANT_FILE: &str = ".selo_merchant.json";
+
+/// One tracked wallet. The primary wallet is the default receiving address;
+/// additional tracked wallets exist for multi-terminal POS setups where each
+/// terminal settles into its own account.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TrackedWallet {
+    pubkey: String,
+    name: String,
+    primary: bool,
+}
+
+/// Persisted merchant setup. Mode is `personal` by default (one wallet, the
+/// operator's own), or `business` when the operator invoices and settles as a
+/// merchant with one or more receiving wallets.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MerchantConfig {
+    mode: String,
+    updated_at: u64,
+    tracked_wallets: Vec<TrackedWallet>,
+}
+
+impl MerchantConfig {
+    fn new() -> Self {
+        Self {
+            mode: "personal".to_string(),
+            updated_at: 0,
+            tracked_wallets: Vec::new(),
+        }
+    }
+
+    fn primary(&self) -> Option<&TrackedWallet> {
+        self.tracked_wallets.iter().find(|w| w.primary)
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -63,8 +99,8 @@ enum Commands {
     /// build and anchor a daily trading close with Poseidon Merkle commitment
     #[command(about = "Build and anchor a daily trading close with Poseidon Merkle commitment", long_about = None)]
     Close {
-        #[arg(long, help = "Merchant wallet public key address")]
-        merchant: String,
+        #[arg(long, help = "Merchant wallet public key address (defaults to the configured merchant)")]
+        merchant: Option<String>,
         #[arg(long, help = "Start of day unix timestamp")]
         start: i64,
         #[arg(long, help = "End of day unix timestamp")]
@@ -75,15 +111,16 @@ enum Commands {
     /// issue a Solana Pay quote with single-use reference key
     #[command(
         about = "Issue a Solana Pay payment intent quote",
-        after_help = "EXAMPLE:\n  selo-tool issue --amount 500000000 --recipient <PUBKEY> --label \"Design Work\""
+        after_help = "EXAMPLES:\n  selo-tool issue --sol 1.5 --recipient <PUBKEY> --label \"Design Work\"\n  selo-tool issue --amount 500000000 --recipient <PUBKEY>"
     )]
     Issue {
         #[arg(
             long,
-            default_value = "500000000",
             help = "Amount in raw lamports (1 SOL = 1,000,000,000 lamports)"
         )]
-        amount: u64,
+        amount: Option<u64>,
+        #[arg(long, help = "Amount in SOL (human-friendly, e.g. 1.5)")]
+        sol: Option<String>,
         #[arg(long, help = "Recipient Base58 wallet or token account address")]
         recipient: String,
         #[arg(long, help = "Human-readable label displayed in wallet UI")]
@@ -188,8 +225,8 @@ enum Commands {
         after_help = "EXAMPLE:\n  selo-tool anchor --merchant <PUBKEY> --start 1750000000 --end 1750086400 --nonce-account <NONCE_ACCOUNT> --authority <NONCE_AUTHORITY>\n\nBuilds the day close from settled quotes, reads the nonce account state on chain,\nand renders an unsigned transaction carrying an AdvanceNonceAccount instruction\nplus the Poseidon commitment as an SPL Memo. A human signs and broadcasts it."
     )]
     Anchor {
-        #[arg(long, help = "Merchant wallet public key address whose day is being anchored")]
-        merchant: String,
+        #[arg(long, help = "Merchant wallet public key address (defaults to the configured merchant)")]
+        merchant: Option<String>,
         #[arg(long, help = "Start of day unix timestamp")]
         start: i64,
         #[arg(long, help = "End of day unix timestamp")]
@@ -239,6 +276,26 @@ enum Commands {
     Verify {
         #[arg(long, help = "Target cryptographic Poseidon state root hash")]
         root: String,
+    },
+    /// list ingested wallet ledgers on disk
+    #[command(about = "List ingested wallet ledgers and their lot counts")]
+    Wallets,
+    /// view or configure the tracked merchant wallet(s) for daily closes
+    #[command(
+        about = "View or configure the tracked merchant wallet(s) for daily closes",
+        after_help = "EXAMPLES:\n  selo-tool merchant\n  selo-tool merchant --set <PUBKEY> --name \"My Shop\" --mode business\n  selo-tool merchant --add <PUBKEY> --name \"POS Terminal 2\"\n  selo-tool merchant --remove <PUBKEY>"
+    )]
+    Merchant {
+        #[arg(long, help = "Set the primary merchant wallet (personal or business)")]
+        set: Option<String>,
+        #[arg(long, help = "Human-readable label for the wallet")]
+        name: Option<String>,
+        #[arg(long, help = "Mode: personal (default) or business")]
+        mode: Option<String>,
+        #[arg(long, help = "Add a tracked wallet (POS multi-wallet)")]
+        add: Option<String>,
+        #[arg(long, help = "Remove a tracked wallet")]
+        remove: Option<String>,
     },
     /// record sample acquisition to test ongoing live PTAX integration
     #[command(about = "Record sample acquisition using live BCB PTAX exchange rate")]
@@ -296,6 +353,54 @@ fn save_multi_ledger(pubkey: &str, ledger: &MultiWalletLedger) {
     if let Ok(data) = serde_json::to_string_pretty(ledger) {
         let _ = fs::write(filename, data);
     }
+}
+
+fn load_merchant() -> MerchantConfig {
+    if Path::new(MERCHANT_FILE).exists() {
+        if let Ok(data) = fs::read_to_string(MERCHANT_FILE) {
+            if let Ok(cfg) = serde_json::from_str(&data) {
+                return cfg;
+            }
+        }
+    }
+    MerchantConfig::new()
+}
+
+fn save_merchant(cfg: &MerchantConfig) {
+    if let Ok(data) = serde_json::to_string_pretty(cfg) {
+        let _ = fs::write(MERCHANT_FILE, data);
+    }
+}
+
+/// Resolve the wallets a daily close should run against. When the operator
+/// names a merchant explicitly it wins; otherwise the persisted merchant
+/// config supplies the tracked wallets. Returns the list of pubkeys to close.
+fn close_wallets(explicit: Option<&str>, rules: &CounterpartyRegistry) -> Result<Vec<String>, String> {
+    if let Some(m) = explicit {
+        return Ok(vec![resolve_address(m, rules)]);
+    }
+    let cfg = load_merchant();
+    if cfg.tracked_wallets.is_empty() {
+        return Err(
+            "No merchant configured. Run 'selo-tool merchant --set <pubkey> --name <label>' \
+             or pass --merchant <pubkey>."
+                .to_string(),
+        );
+    }
+    let mut wallets: Vec<String> = cfg
+        .tracked_wallets
+        .iter()
+        .map(|w| w.pubkey.clone())
+        .collect();
+    // Deterministic order: primary first, then the rest by pubkey.
+    wallets.sort_by_key(|w| {
+        if cfg.primary().map(|p| p.pubkey == *w).unwrap_or(false) {
+            (0, w.clone())
+        } else {
+            (1, w.clone())
+        }
+    });
+    Ok(wallets)
 }
 
 /// Map a Solana mint address to a human-readable asset symbol.
@@ -601,37 +706,53 @@ fn main() -> Result<(), String> {
             end,
             output,
         } => {
-            let resolved_merchant = resolve_address(&merchant, &rules);
-            println!(
-                "Building daily close for merchant {} from {} to {}...",
-                resolved_merchant, start, end
-            );
-
-            let close_record = build_close_from_store(&resolved_merchant, start, end)?;
-
+            let wallets = close_wallets(merchant.as_deref(), &rules)?;
             let blockhash = engine.rpc.get_latest_blockhash()?;
-            let prepared = selo_core::close::prepare_anchor(&close_record, &blockhash, None)?;
+            for (idx, resolved_merchant) in wallets.iter().enumerate() {
+                if wallets.len() > 1 {
+                    println!(
+                        "===== Close {}/{} · merchant {} =====",
+                        idx + 1,
+                        wallets.len(),
+                        resolved_merchant
+                    );
+                } else {
+                    println!(
+                        "Building daily close for merchant {} from {} to {}...",
+                        resolved_merchant, start, end
+                    );
+                }
 
-            if let Some(out_path) = output {
-                fs::write(&out_path, close_record.canonical_record()).map_err(|e| {
-                    format!("Failed to write canonical record to {}: {}", out_path, e)
-                })?;
-                println!("âœ“ Canonical audit record written to '{}'", out_path);
+                let close_record = build_close_from_store(resolved_merchant, start, end)?;
+                let prepared = selo_core::close::prepare_anchor(&close_record, &blockhash, None)?;
+
+                if let Some(out_path) = &output {
+                    let path = if wallets.len() > 1 {
+                        let short = &resolved_merchant[..resolved_merchant.len().min(8)];
+                        format!("{}.{}", out_path, short)
+                    } else {
+                        out_path.clone()
+                    };
+                    fs::write(&path, close_record.canonical_record()).map_err(|e| {
+                        format!("Failed to write canonical record to {}: {}", path, e)
+                    })?;
+                    println!("✓ Canonical audit record written to '{}'", path);
+                }
+
+                println!("===================================================");
+                println!("          DAILY ACCOUNT CLOSE & COMMITMENT         ");
+                println!("===================================================");
+                println!("Merchant Pubkey : {}", resolved_merchant);
+                println!("Window          : {} -> {}", start, end);
+                println!("Lines Count     : {}", close_record.lines.len());
+                println!("Commitment Base58: {}", close_record.commitment_base58());
+                println!("Anchor Memo     : {}", close_record.anchor_memo());
+                println!(
+                    "Prepared Tx Sig : Ready for merchant signature (Blockhash: {})",
+                    prepared.blockhash
+                );
+                println!("==================================================");
             }
-
-            println!("===================================================");
-            println!("          DAILY ACCOUNT CLOSE & COMMITMENT         ");
-            println!("===================================================");
-            println!("Merchant Pubkey : {}", resolved_merchant);
-            println!("Window          : {} -> {}", start, end);
-            println!("Lines Count     : {}", close_record.lines.len());
-            println!("Commitment Base58: {}", close_record.commitment_base58());
-            println!("Anchor Memo     : {}", close_record.anchor_memo());
-            println!(
-                "Prepared Tx Sig : Ready for merchant signature (Blockhash: {})",
-                prepared.blockhash
-            );
-            println!("==================================================");
         }
         Commands::Refund {
             quote_id,
@@ -782,15 +903,13 @@ fn main() -> Result<(), String> {
             nonce_account,
             authority,
         } => {
-            let resolved_merchant = resolve_address(&merchant, &rules);
+            let wallets = close_wallets(merchant.as_deref(), &rules)?;
             println!(
-                "Generating durable-nonce anchor for merchant {} from {} to {}...",
-                resolved_merchant, start, end
+                "Generating durable-nonce anchor from {} to {}...",
+                start, end
             );
             println!("  Nonce account : {}", nonce_account);
             println!("  Nonce authority: {}", authority);
-
-            let close_record = build_close_from_store(&resolved_merchant, start, end)?;
 
             println!("Fetching nonce account state from chain...");
             let account = engine.rpc.get_account_info(&nonce_account)?;
@@ -802,6 +921,17 @@ fn main() -> Result<(), String> {
             }
             let nonce_state =
                 selo_core::nonce::nonce_state_from_account_info(&nonce_account, &authority, &account)?;
+
+            for (idx, resolved_merchant) in wallets.iter().enumerate() {
+                if wallets.len() > 1 {
+                    println!(
+                        "===== Anchor {}/{} · merchant {} =====",
+                        idx + 1,
+                        wallets.len(),
+                        resolved_merchant
+                    );
+                }
+                let close_record = build_close_from_store(resolved_merchant, start, end)?;
 
             let prepared = selo_core::close::prepare_anchor(
                 &close_record,
@@ -833,23 +963,42 @@ fn main() -> Result<(), String> {
                  Poseidon commitment, so the anchor never expires while awaiting signature."
             );
             println!("===================================================");
+            }
         }
         Commands::Issue {
             amount,
+            sol,
             recipient,
             label,
             message,
         } => {
             let resolved_recipient = resolve_address(&recipient, &rules);
+            let amount = match (amount, sol.as_deref()) {
+                (Some(lamports), _) => lamports,
+                (None, Some(sol_str)) => selo_core::format::sol_to_lamports(sol_str)?,
+                (None, None) => {
+                    return Err(
+                        "Provide --sol <SOL> (e.g. 1.5) or --amount <lamports>.".to_string()
+                    )
+                }
+            };
             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            // Counter in high 16 bits, millisecond timestamp in low 48 bits.
-            // Guarantees uniqueness within a ms and keeps all 8 bytes populated
-            // so the base58 encoding is always long enough for the 44-char slice.
+            // Reference key: a valid 32-byte pubkey derived from the ms
+            // timestamp and a process-local counter, spread across the full
+            // key so the base58 encoding is always a 44-char valid address.
+            // getSignaturesForAddress(reference) is what confirm scans, so the
+            // reference must be a real Solana account-shaped key.
             let counter = QUOTE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let ref_key_seed = (now.as_millis() as u64) | ((counter as u64) << 48);
-            let ref_bytes: [u8; 8] = ref_key_seed.to_le_bytes();
-            let ref_pubkey = bs58::encode(ref_bytes).into_string() + "RefKey99999999999999999999";
-            let reference_pubkey = ref_pubkey[..44.min(ref_pubkey.len())].to_string();
+            let seed_bytes = ref_key_seed.to_le_bytes();
+            let mut ref_bytes = [0u8; 32];
+            for i in 0..8 {
+                ref_bytes[i] = seed_bytes[i];
+                ref_bytes[i + 8] = seed_bytes[i] ^ 0xA5;
+                ref_bytes[i + 16] = seed_bytes[i] ^ 0x5A;
+                ref_bytes[i + 24] = seed_bytes[i] ^ 0xFF;
+            }
+            let reference_pubkey = bs58::encode(&ref_bytes).into_string();
             let now_secs = now.as_secs();
 
             let params = SolanaPayParams {
@@ -876,7 +1025,7 @@ fn main() -> Result<(), String> {
             });
             save_store(&store);
 
-            println!("âœ“ Quote Issued Successfully [{}]", quote_id);
+            println!("✓ Quote Issued Successfully [{}]", quote_id);
             println!("  Recipient  : {}", resolved_recipient);
             println!(
                 "  Amount     : {} lamports ({} SOL)",
@@ -884,6 +1033,19 @@ fn main() -> Result<(), String> {
                 selo_core::format::lamports_to_sol(amount)
             );
             println!("  Solana Pay : {}", uri);
+            match qrcode::QrCode::new(uri.as_bytes()) {
+                Ok(code) => {
+                    println!("  QR Code    : (scan with a Solana wallet)");
+                    let qr = code
+                        .render::<qrcode::render::unicode::Dense1x2>()
+                        .module_dimensions(1, 1)
+                        .build();
+                    for line in qr.lines() {
+                        println!("    {}", line);
+                    }
+                }
+                Err(_) => println!("  QR Code    : (unavailable)"),
+            }
         }
         Commands::Check => {
             let store = load_store();
@@ -1074,11 +1236,55 @@ fn main() -> Result<(), String> {
             let mut unclassified_addrs = std::collections::BTreeSet::new();
             let mut date_cache = DateCache::new(fx_source);
 
-            for sig in fresh_sigs.iter() {
-                match engine.rpc.get_transaction(sig) {
-                    Ok(tx_data) if !tx_data.is_null() => {
+            // Fetch transactions concurrently. A wallet with tens of thousands
+            // of signatures is dominated by sequential getTransaction round
+            // trips, so prefetch a bounded window in parallel and then process
+            // the window in signature order. Checkpointing still runs after
+            // every signature, so a crash resumes from the same place.
+            let rpc_arc = Arc::new(ToolRpc::new(&rpc_url));
+            let fetch_workers = 8usize;
+
+            // Progress tracking for the CLI and for the Telegram adapter, which
+            // parses these lines to show the operator a percentage and an ETA.
+            let total_fresh = fresh_sigs.len();
+            let ingest_start = SystemTime::now();
+            let mut done_count: usize = 0;
+
+            let mut sig_iter = fresh_sigs.iter().peekable();
+            while sig_iter.peek().is_some() {
+                let window: Vec<&String> = sig_iter.by_ref().take(64).map(|s| *s).collect();
+                let fetched = std::thread::scope(|scope| {
+                    let mut handles = Vec::new();
+                    let mut chunks: Vec<Vec<&String>> = Vec::new();
+                    let chunk_size = window.len().div_ceil(fetch_workers).max(1);
+                    for chunk in window.chunks(chunk_size) {
+                        chunks.push(chunk.to_vec());
+                    }
+                    for chunk in chunks {
+                        let rpc = Arc::clone(&rpc_arc);
+                        handles.push(scope.spawn(move || {
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for sig in chunk {
+                                let tx = rpc.get_transaction(sig).ok().filter(|v| !v.is_null());
+                                out.push((sig.clone(), tx));
+                            }
+                            out
+                        }));
+                    }
+                    let mut merged: Vec<(String, Option<Value>)> = Vec::with_capacity(window.len());
+                    for h in handles {
+                        merged.extend(h.join().unwrap_or_default());
+                    }
+                    // Restore signature order so events are recorded in the
+                    // same order a sequential run would have produced them.
+                    merged.sort_by_key(|(sig, _)| sig.clone());
+                    merged
+                });
+
+                for (sig, tx_data) in fetched {
+                    if let Some(tx_data) = tx_data {
                         let events =
-                            parse_transaction_events(sig, &tx_data, &resolved_addr, &rules);
+                            parse_transaction_events(&sig, &tx_data, &resolved_addr, &rules);
                         for ev in &events {
                             if ev.is_classified {
                                 classified_count += 1;
@@ -1108,14 +1314,8 @@ fn main() -> Result<(), String> {
                                 ledger_ref.record_event(ev.clone());
                             }
 
-                            let decimals = if ev.mint.starts_with("So111")
-                                || ev.mint == selo_core::ledger::NATIVE_SOL_MINT
-                            {
-                                9
-                            } else {
-                                6
-                            };
-                            let ui_amt = ev.amount_base_units as f64 / 10f64.powi(decimals);
+                            let decimals = ev.decimals;
+                            let ui_amt = ev.amount_base_units as f64 / 10f64.powi(decimals as i32);
                             let cp_display: String = match &ev.counterparty {
                                 Some(label) if label.len() > 18 => {
                                     format!("{}...", &label[..18])
@@ -1151,17 +1351,36 @@ fn main() -> Result<(), String> {
                         // can create opening-balance lots for assets with a
                         // net shortfall (funded externally or before tracking).
                     }
-                    _ => {}
-                }
 
-                // Save after every transaction so an interrupted run
-                // can resume from where it left off.
-                {
-                    let ledger = multi_ledger.get_mut_ledger(&resolved_addr);
-                    ledger.processed_signatures.insert(sig.to_string());
+                    // Save periodically so an interrupted run resumes close
+                    // to where it stopped, without paying the cost of a full
+                    // JSON serialization after every single signature (which
+                    // dominates ingest once the file grows past a few MB).
+                    {
+                        let ledger = multi_ledger.get_mut_ledger(&resolved_addr);
+                        ledger.processed_signatures.insert(sig.to_string());
+                    }
+                    done_count += 1;
+                    if done_count % 25 == 0 || done_count == total_fresh {
+                        let elapsed = SystemTime::now()
+                            .duration_since(ingest_start)
+                            .unwrap_or_default()
+                            .as_secs_f64();
+                        let rate = done_count as f64 / elapsed.max(0.001);
+                        let remaining = total_fresh.saturating_sub(done_count);
+                        let eta_secs = (remaining as f64 / rate.max(0.001)) as u64;
+                        let pct = (done_count as f64 / total_fresh.max(1) as f64) * 100.0;
+                        println!(
+                            "SELO_PROGRESS {}/{} ({:.1}%) ~{:.1}/s ETA {}s",
+                            done_count, total_fresh, pct, rate, eta_secs
+                        );
+                    }
+                    if event_index % 100 == 0 {
+                        save_multi_ledger(&resolved_addr, &multi_ledger);
+                    }
                 }
-                save_multi_ledger(&resolved_addr, &multi_ledger);
             }
+            save_multi_ledger(&resolved_addr, &multi_ledger);
 
             // ---- Integer FIFO book reconcile ----
             //
@@ -1371,6 +1590,7 @@ fn main() -> Result<(), String> {
                     kind: selo_core::ledger::EventKind::Income,
                     amount_base_units: 1_000_000_000,
                     mint: selo_core::ledger::NATIVE_SOL_MINT.to_string(),
+                    decimals: 9,
                     counterparty: Some("Sample".to_string()),
                     counterparty_address: None,
                     signature: format!("sample-live-{}", now),
@@ -1397,6 +1617,7 @@ fn main() -> Result<(), String> {
             to,
             output,
         } => {
+            let multi_all = load_all_multi_ledgers();
             let resolved_wallet = wallet.as_deref().map(|w| resolve_address(w, &rules));
             let ledger = match &resolved_wallet {
                 Some(w) => {
@@ -1413,8 +1634,50 @@ fn main() -> Result<(), String> {
                     }
                 }
                 None => {
-                    let multi = load_all_multi_ledgers();
-                    multi.cumulative_ledger()
+                    // No wallet named: export the sole ingested wallet, or if
+                    // several exist, list them and require a choice. Never
+                    // silently blend wallets into one report.
+                    if multi_all.wallets.is_empty() {
+                        println!(
+                            "No ledger files found. Run 'selo-tool ingest <pubkey> --all' first."
+                        );
+                        return Ok(());
+                    }
+                    if multi_all.wallets.len() == 1 {
+                        let (sole_key, _) = multi_all.wallets.iter().next().unwrap();
+                        match multi_all.get_ledger(sole_key) {
+                            Some(l) => l.clone(),
+                            None => {
+                                println!("No ledger found for wallet '{}'. Run ingest first.", sole_key);
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        println!(
+                            "{} wallets are ingested. Pass --wallet <pubkey-or-name> to choose which one to export:",
+                            multi_all.wallets.len()
+                        );
+                        println!("{:-<60}", "");
+                        let mut wallets: Vec<&String> = multi_all.wallets.keys().collect();
+                        wallets.sort();
+                        for pubkey in wallets {
+                            let label = rules.get_name(pubkey);
+                            let label_note = if &label == pubkey {
+                                String::new()
+                            } else {
+                                format!(" ({})", label)
+                            };
+                            println!("  {}{}", pubkey, label_note);
+                        }
+                        println!(
+                            "{:-<60}",
+                            ""
+                        );
+                        println!(
+                            "Example: selo-tool export-html --year 2026 --wallet <pubkey> --output audit.html"
+                        );
+                        return Ok(());
+                    }
                 }
             };
             if ledger.is_empty() {
@@ -1481,6 +1744,125 @@ fn main() -> Result<(), String> {
                 println!("âœ“ VERIFICATION SUCCESSFUL: Local ledger state cryptographically matches the target root!");
             } else {
                 println!("âœ— VERIFICATION FAILED: Computed root does not match target root. Ledger data may have been altered.");
+            }
+        }
+        Commands::Wallets => {
+            let multi_ledger = load_all_multi_ledgers();
+            if multi_ledger.wallets.is_empty() {
+                println!("No ledger files found. Run 'selo-tool ingest <pubkey> --all' first.");
+                return Ok(());
+            }
+            println!("Ingested wallet ledgers ({}):", multi_ledger.wallets.len());
+            println!("{:-<60}", "");
+            let mut wallets: Vec<(&String, &selo_core::lots::TaxLedger)> =
+                multi_ledger.wallets.iter().collect();
+            wallets.sort_by(|a, b| a.0.cmp(b.0));
+            for (pubkey, ledger) in wallets {
+                let label = rules.get_name(pubkey);
+                let label_note = if &label == pubkey {
+                    String::new()
+                } else {
+                    format!(" ({})", label)
+                };
+                let first = ledger
+                    .lots
+                    .iter()
+                    .map(|l| l.acquired_at_utc.clone())
+                    .min()
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "  {}{}\n    lots: {}  gains: {}  from: {}",
+                    pubkey,
+                    label_note,
+                    ledger.lots.len(),
+                    ledger.gain_records.len(),
+                    first
+                );
+            }
+        }
+        Commands::Merchant {
+            set,
+            name,
+            mode,
+            add,
+            remove,
+        } => {
+            let mut cfg = load_merchant();
+            if let Some(pubkey) = &set {
+                let resolved = resolve_address(pubkey, &rules);
+                let wallet_name = name.clone().unwrap_or_else(|| rules.get_name(&resolved));
+                let mode = mode.clone().unwrap_or_else(|| "personal".to_string());
+                if mode != "personal" && mode != "business" {
+                    return Err(format!("Unknown mode '{}'. Use personal or business.", mode));
+                }
+                cfg.mode = mode;
+                cfg.updated_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                // Replace any existing primary, then ensure this wallet is
+                // the primary tracked wallet.
+                cfg.tracked_wallets.retain(|w| w.pubkey != resolved);
+                cfg.tracked_wallets
+                    .retain(|w| w.pubkey == resolved || !w.primary);
+                cfg.tracked_wallets.push(TrackedWallet {
+                    pubkey: resolved.clone(),
+                    name: wallet_name,
+                    primary: true,
+                });
+                save_merchant(&cfg);
+                println!("✓ Merchant configured (mode: {}):", cfg.mode);
+                for w in &cfg.tracked_wallets {
+                    let mark = if w.primary { "primary" } else { "tracked" };
+                    println!("  {}  {}  ({})", mark, w.pubkey, w.name);
+                }
+                return Ok(());
+            }
+            if let Some(pubkey) = &add {
+                let resolved = resolve_address(pubkey, &rules);
+                if cfg.tracked_wallets.iter().any(|w| w.pubkey == resolved) {
+                    println!("Wallet {} is already tracked.", resolved);
+                    return Ok(());
+                }
+                let wallet_name = name.clone().unwrap_or_else(|| rules.get_name(&resolved));
+                cfg.tracked_wallets.push(TrackedWallet {
+                    pubkey: resolved.clone(),
+                    name: wallet_name,
+                    primary: false,
+                });
+                cfg.updated_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                save_merchant(&cfg);
+                println!("✓ Added tracked wallet {} ({})", resolved, rules.get_name(&resolved));
+                return Ok(());
+            }
+            if let Some(pubkey) = &remove {
+                let resolved = resolve_address(pubkey, &rules);
+                let before = cfg.tracked_wallets.len();
+                cfg.tracked_wallets.retain(|w| w.pubkey != resolved);
+                if cfg.tracked_wallets.len() == before {
+                    println!("Wallet {} was not tracked.", resolved);
+                    return Ok(());
+                }
+                // If the primary was removed, promote the first remaining.
+                if cfg.primary().is_none() && !cfg.tracked_wallets.is_empty() {
+                    cfg.tracked_wallets[0].primary = true;
+                }
+                save_merchant(&cfg);
+                println!("✓ Removed tracked wallet {}", resolved);
+                return Ok(());
+            }
+            if cfg.tracked_wallets.is_empty() {
+                println!("Merchant: unconfigured (mode: {})", cfg.mode);
+                println!("  Run 'selo-tool merchant --set <pubkey> --name <label>' to set up.");
+            } else {
+                println!("Merchant (mode: {}):", cfg.mode);
+                for w in &cfg.tracked_wallets {
+                    let mark = if w.primary { "primary" } else { "tracked" };
+                    println!("  {:<7} {}  ({})", mark, w.pubkey, w.name);
+                }
             }
         }
     }

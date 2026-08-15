@@ -96,6 +96,39 @@ impl RpcSeam for ToolRpc {
         Ok(sigs)
     }
 
+    fn get_signatures_paginated_with_time(
+        &self,
+        address: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<i64>)>, String> {
+        let mut opts = json!({ "limit": limit });
+        if let Some(sig) = before {
+            opts["before"] = json!(sig);
+        }
+
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [address, opts]
+        });
+
+        let res = self.post(payload)?;
+        let items = res["result"]
+            .as_array()
+            .ok_or_else(|| "Failed to parse signatures array from RPC response".to_string())?;
+
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                item["signature"]
+                    .as_str()
+                    .map(|s| (s.to_string(), item["blockTime"].as_i64()))
+            })
+            .collect())
+    }
+
     fn get_transaction(&self, sig: &str) -> Result<Value, String> {
         let payload = json!({
             "jsonrpc": "2.0",

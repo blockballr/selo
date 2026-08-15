@@ -47,6 +47,24 @@ pub trait RpcSeam {
         self.get_signatures(address)
     }
 
+    /// Paginated signatures with each entry's block time (unix seconds) when
+    /// the transport can provide it. Signatures arrive newest-first, so a
+    /// caller can stop paging once the oldest entry in a page predates a
+    /// `since` bound without fetching every transaction. Defaults to `None`
+    /// block times; transports that resolve times cheaply override it.
+    fn get_signatures_paginated_with_time(
+        &self,
+        address: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<i64>)>, String> {
+        Ok(self
+            .get_signatures_paginated(address, before, limit)?
+            .into_iter()
+            .map(|sig| (sig, None))
+            .collect())
+    }
+
     fn get_transaction(&self, sig: &str) -> Result<Value, String>;
 
     /// Fetch a raw account, returned as the JSON-RPC `result` value. Used

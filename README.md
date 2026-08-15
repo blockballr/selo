@@ -232,9 +232,15 @@ ingest.
 ### ZeroClaw Integration
 
 Selo runs through ZeroClaw 0.8.4 as the `selo` agent with the `selo` skill
-(see `zeroclaw.toml` for the canonical wiring and `skills/selo/SKILL.md` for
-the skill definition). The agent's model brain interprets messages and
-invokes the selo-tool release binary, which owns the money path.
+(see `zeroclaw.toml` for the canonical wiring and `skills/selo/SKILL.toml` for
+the skill definition). The skill carries `[[tools]]` shell entries, one per
+selo-tool subcommand, so the agent's model brain dispatches to the selo-tool
+release binary through registered tool calls. A SKILL.md alone would load as
+documentation with zero tools; the tool definitions must live in SKILL.toml.
+
+The agent workspace is set to this repository root, because the skill shell
+tools run selo-tool from that working directory where the state files
+(`.selo_store.json`, `.selo_rules.json`, `.selo_ledger_*.json`, `.env`) live.
 
 The security model is enforced in two layers. First, the agent runs under a
 narrow risk profile (`selo-safe`): it may only run `selo-tool`, and only the
@@ -243,7 +249,10 @@ read/query/close-prep subcommands. The money-moving and mutation commands
 human-only behind confirm-token gates. Second, selo-tool itself never signs:
 a daily close or anchor produces an unsigned transaction that requires the
 human T1 signature before broadcast, so prompt injection cannot reach a
-destination-changing command or a private key.
+destination-changing command or a private key. The `close` and `anchor` tools
+are registered under their composed names `selo__close` / `selo__anchor`, so
+the risk profile's `always_ask` lists those exact names to force a human
+approval prompt before either runs.
 
 **Telegram (primary surface).** The Telegram channel is enabled and bound to
 the agent. The standalone adapter at `adapters/telegram/main.py` remains the
@@ -256,9 +265,14 @@ control path.
 the stock ZeroClaw 0.8.4 binary does not compile in the WhatsApp channel; a
 source build with the WhatsApp channel feature is required.
 
-Live credentials (bot token, Gemini API key) are encrypted secrets in
-`~/.zeroclaw/config.toml`, set via masked input, never in version control.
-Full setup instructions are in `adapters/README.md`.
+The agent's model brain runs on the opencode-go provider (`opencode.go`,
+model `deepseek-v4-flash`). Live credentials (Telegram bot token, opencode API
+key) are resolved at launch from the gitignored `.env` file: the launcher
+`tools/start-zeroclaw.ps1` loads every `ZEROCLAW_*` variable into the process
+environment, and ZeroClaw resolves them as config overrides. The key variables
+are `ZEROCLAW_channels__telegram__primary__bot_token` and
+`ZEROCLAW_providers__models__opencode__go__api_key`. Never commit `.env`; it
+is already gitignored. Full setup instructions are in `adapters/README.md`.
 
 ### License
 

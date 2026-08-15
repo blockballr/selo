@@ -211,7 +211,7 @@ impl TaxLedger {
             sort_disposals, BasisEvidence, DisposalEvent, Lot as BasisLot, LotBook,
             oracle_cost,
         };
-        use crate::ledger::{decimals_for_symbol, mint_to_symbol, EventKind};
+        use crate::ledger::{decimals_for_event, mint_to_symbol, EventKind};
         use crate::ptax::{unix_to_ymd, DEFAULT_HISTORICAL_PTAX};
         use std::collections::HashMap;
 
@@ -292,23 +292,23 @@ impl TaxLedger {
         // income). The synthetic opening lot must cover the worst drawdown
         // across the whole timeline, not merely the final net, so a later
         // disposal can never be refused against money the tool never saw
-        // arrive. Walking the timeline gives that peak exactly.
+        // arrive. Walking the timeline gives that peak exactly. Assets are
+        // keyed by mint, so distinct tokens never merge into one bucket.
         let mut opening_shortfall: HashMap<String, i128> = HashMap::new();
         {
             let mut running: HashMap<String, i128> = HashMap::new();
             for ev in &events {
-                let symbol = mint_to_symbol(&ev.mint).to_string();
                 let delta = match ev.kind {
                     EventKind::Income => ev.amount_base_units as i128,
                     EventKind::Expense => -(ev.amount_base_units as i128),
                     _ => 0,
                 };
-                let bal = running.entry(symbol.clone()).or_insert(0);
+                let bal = running.entry(ev.mint.clone()).or_insert(0);
                 *bal += delta;
                 // The most negative balance reached is how much external
                 // funding the position leaned on at its weakest point.
                 if *bal < 0 {
-                    let need = opening_shortfall.entry(symbol).or_insert(0);
+                    let need = opening_shortfall.entry(ev.mint.clone()).or_insert(0);
                     if -*bal > *need {
                         *need = -*bal;
                     }
@@ -316,36 +316,42 @@ impl TaxLedger {
             }
         }
 
-        let mut mint_of: HashMap<String, String> = HashMap::new();
-        for ev in &events {
-            mint_of
-                .entry(mint_to_symbol(&ev.mint).to_string())
-                .or_insert_with(|| ev.mint.clone());
-        }
-
         let mut book = LotBook::new(self.book.method);
         // HashMap iteration order is randomized per process, which would
         // give the opening lots a different acceptance sequence on every
         // run and make the persisted book not byte-identical. Iterate the
-        // symbols in sorted order so the rebuilt book is deterministic.
-        let mut shortfall_symbols: Vec<&String> = opening_shortfall.keys().collect();
-        shortfall_symbols.sort();
-        for symbol in shortfall_symbols {
-            let shortfall = *opening_shortfall.get(symbol).unwrap() as u128;
+        // mints in sorted order so the rebuilt book is deterministic.
+        let mut shortfall_mints: Vec<&String> = opening_shortfall.keys().collect();
+        shortfall_mints.sort();
+        for mint in shortfall_mints {
+            let shortfall = *opening_shortfall.get(mint).unwrap() as u128;
             if shortfall == 0 {
                 continue;
             }
-            let mint = mint_of
-                .get(symbol)
-                .cloned()
-                .unwrap_or_else(|| crate::ledger::NATIVE_SOL_MINT.to_string());
-            let cost_micro_per_token =
-                (cost_of(&mut self.rates, symbol, &earliest_ymd, &|| rate(symbol, &earliest_ymd))
-                    * MICRO_PER_BRL) as u128;
-            let cost = oracle_cost(shortfall, cost_micro_per_token, decimals_for_symbol(symbol))?;
+            let symbol = mint_to_symbol(mint).to_string();
+            let decimals = decimals_for_event(&self.events, mint);
+            // An unknown token has no historical price. Inventing a $1 value
+            // for a memecoin whose opening position was funded externally
+            // would fabricate a huge fake cost basis; the honest figure is
+            // zero basis, so any later disposal books proceeds as gain.
+            let is_known = symbol == "SOL"
+                || symbol == "USDC"
+                || symbol == "USDT"
+                || symbol == "PYUSD";
+            let cost_micro_per_token = if is_known {
+                (cost_of(
+                    &mut self.rates,
+                    &symbol,
+                    &earliest_ymd,
+                    &|| rate(&symbol, &earliest_ymd),
+                ) * MICRO_PER_BRL) as u128
+            } else {
+                0
+            };
+            let cost = oracle_cost(shortfall, cost_micro_per_token, decimals)?;
             book.acquire(BasisLot {
-                mint,
-                acquisition_ref: format!("opening-balance-{}-{}", symbol, earliest_ymd),
+                mint: mint.clone(),
+                acquisition_ref: format!("opening-balance-{}-{}", mint, earliest_ymd),
                 acquired_at_unix: earliest_unix,
                 quantity_base_units: shortfall,
                 cost_base_units: cost,
@@ -360,17 +366,75 @@ impl TaxLedger {
         // day's rate; Expense closes lots with proceeds from any income in
         // the same signature (a swap) or nothing (a pure payment).
         for ev in &events {
-            let symbol = mint_to_symbol(&ev.mint).to_string();
             let date_ymd = unix_to_ymd(ev.block_time_unix.unwrap_or(0));
             match ev.kind {
                 EventKind::Income if ev.amount_base_units > 0 => {
-                    let cost_micro_per_token =
-                        (cost_of(&mut self.rates, &symbol, &date_ymd, &|| rate(&symbol, &date_ymd))
-                            * MICRO_PER_BRL) as u128;
+                    // Cost of this acquisition. Known assets (SOL, the
+                    // tracked stablecoins) price at their day's oracle rate.
+                    // Unknown tokens have no historical price feed, so a swap
+                    // values them by the value of the known leg exchanged in
+                    // the same transaction: the BRL cost of what this wallet
+                    // gave up to receive them. A lone airdrop or fee has no
+                    // pricable leg, so it books at zero basis rather than an
+                    // invented $1 price that would poison the book.
+                    let symbol = mint_to_symbol(&ev.mint).to_string();
+                    let is_known = symbol == "SOL"
+                        || symbol == "USDC"
+                        || symbol == "USDT"
+                        || symbol == "PYUSD";
+                    let cost_micro_per_token = if is_known {
+                        (cost_of(
+                            &mut self.rates,
+                            &symbol,
+                            &date_ymd,
+                            &|| rate(&symbol, &date_ymd),
+                        ) * MICRO_PER_BRL) as u128
+                    } else {
+                        // Swap-pair valuation: the known leg this wallet spent
+                        // to acquire the unknown token becomes its cost.
+                        let mut spent_micro: u128 = 0;
+                        for sibling in &events {
+                            if sibling.signature == ev.signature
+                                && sibling.kind == EventKind::Expense
+                                && sibling.amount_base_units > 0
+                            {
+                                let ss = mint_to_symbol(&sibling.mint).to_string();
+                                let ss_known = ss == "SOL"
+                                    || ss == "USDC"
+                                    || ss == "USDT"
+                                    || ss == "PYUSD";
+                                if !ss_known {
+                                    continue;
+                                }
+                                let sd = unix_to_ymd(sibling.block_time_unix.unwrap_or(0));
+                                let smpt = (cost_of(
+                                    &mut self.rates,
+                                    &ss,
+                                    &sd,
+                                    &|| rate(&ss, &sd),
+                                ) * MICRO_PER_BRL) as u128;
+                                spent_micro += oracle_cost(
+                                    sibling.amount_base_units as u128,
+                                    smpt,
+                                    sibling.decimals as u32,
+                                )?;
+                            }
+                        }
+                        // Total BRL spent across the whole token position,
+                        // divided across every unit acquired.
+                        if spent_micro > 0 && ev.amount_base_units > 0 {
+                            let units = ev.amount_base_units as u128;
+                            let whole = 10u128.checked_pow(ev.decimals as u32).unwrap_or(1);
+                            // BRL spent per whole token, in micro-BRL.
+                            (spent_micro * whole) / units
+                        } else {
+                            0
+                        }
+                    };
                     let cost = oracle_cost(
                         ev.amount_base_units as u128,
                         cost_micro_per_token,
-                        decimals_for_symbol(&symbol),
+                        ev.decimals as u32,
                     )?;
                     book.acquire(BasisLot {
                         mint: ev.mint.clone(),
@@ -385,7 +449,10 @@ impl TaxLedger {
                     })?;
                 }
                 EventKind::Expense if ev.amount_base_units > 0 => {
-                    // Proceeds from same-signature income siblings.
+                    // Proceeds from same-signature income siblings. Only the
+                    // known legs (SOL, tracked stablecoins) have a price; an
+                    // unknown-token leg is valued at zero so a swap between
+                    // two memecoins does not invent a value for either side.
                     let mut proceeds_micro: u128 = 0;
                     for sibling in &events {
                         if sibling.signature == ev.signature
@@ -393,6 +460,13 @@ impl TaxLedger {
                             && sibling.amount_base_units > 0
                         {
                             let s_symbol = mint_to_symbol(&sibling.mint).to_string();
+                            let s_known = s_symbol == "SOL"
+                                || s_symbol == "USDC"
+                                || s_symbol == "USDT"
+                                || s_symbol == "PYUSD";
+                            if !s_known {
+                                continue;
+                            }
                             let s_date = unix_to_ymd(sibling.block_time_unix.unwrap_or(0));
                             let s_micro_per_token = (cost_of(
                                 &mut self.rates,
@@ -403,7 +477,7 @@ impl TaxLedger {
                             proceeds_micro += oracle_cost(
                                 sibling.amount_base_units as u128,
                                 s_micro_per_token,
-                                decimals_for_symbol(&s_symbol),
+                                sibling.decimals as u32,
                             )?;
                         }
                     }
@@ -435,7 +509,7 @@ impl TaxLedger {
         // 4. Project the book onto the f64 records the report consumes.
         for lot in book.remaining_lots() {
             let symbol = mint_to_symbol(&lot.mint).to_string();
-            let decimals = decimals_for_symbol(&symbol);
+            let decimals = decimals_for_event(&self.events, &lot.mint);
             let unit_cost_per_token = if lot.quantity_base_units > 0 {
                 lot.cost_base_units as f64
                     * 10f64.powi(decimals as i32)
@@ -541,7 +615,7 @@ impl TaxLedger {
         } else {
             for lot in &self.lots {
                 report.push_str(&format!(
-                    "Lot ID: {}\n  Asset: {} | Amount: {}\n  Unit Cost (BRL): R$ {:.2} | PTAX: {:.4}\n  Acquired: {}\n--------------------------------------------------\n",
+                    "Lot ID: {}\n  Asset: {} | Amount: {}\n  Unit Cost (BRL): R$ {:.2} | Rate Used (BRL/Unit): {:.4}\n  Acquired: {}\n--------------------------------------------------\n",
                     lot.id,
                     lot.asset_symbol,
                     lot.amount,
@@ -634,6 +708,7 @@ mod tests {
             kind,
             amount_base_units: amount,
             mint: crate::ledger::NATIVE_SOL_MINT.to_string(),
+            decimals: 9,
             counterparty: None,
             counterparty_address: None,
             signature: format!("sig-{day}"),
@@ -681,6 +756,7 @@ mod tests {
             kind: EventKind::Expense,
             amount_base_units: 1_000_000, // 1 USDC, sign lives in the kind
             mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            decimals: 6,
             counterparty: None,
             counterparty_address: None,
             signature: "sig-spend".to_string(),
@@ -719,6 +795,7 @@ mod tests {
             kind,
             amount_base_units: amount,
             mint: crate::ledger::NATIVE_SOL_MINT.to_string(),
+            decimals: 9,
             counterparty: None,
             counterparty_address: None,
             signature: format!("sig-{day}"),
@@ -759,6 +836,7 @@ mod tests {
             kind: EventKind::Income,
             amount_base_units: 1_000_000_000,
             mint: crate::ledger::NATIVE_SOL_MINT.to_string(),
+            decimals: 9,
             counterparty: None,
             counterparty_address: None,
             signature: "sig-in".to_string(),
@@ -769,6 +847,7 @@ mod tests {
             kind: EventKind::Expense,
             amount_base_units: 500_000_000,
             mint: crate::ledger::NATIVE_SOL_MINT.to_string(),
+            decimals: 9,
             counterparty: None,
             counterparty_address: None,
             signature: "sig-out".to_string(),
@@ -814,6 +893,7 @@ mod tests {
             kind: EventKind::Income,
             amount_base_units: 1_000_000_000, // 1 SOL
             mint: crate::ledger::NATIVE_SOL_MINT.to_string(),
+            decimals: 9,
             counterparty: None,
             counterparty_address: None,
             signature: "sig-in".to_string(),
@@ -826,6 +906,7 @@ mod tests {
             kind: EventKind::Expense,
             amount_base_units: 500_000_000, // 0.5 SOL
             mint: crate::ledger::NATIVE_SOL_MINT.to_string(),
+            decimals: 9,
             counterparty: None,
             counterparty_address: None,
             signature: "sig-out".to_string(),
@@ -869,6 +950,7 @@ mod tests {
             kind: EventKind::Income,
             amount_base_units: 1_000_000,
             mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            decimals: 6,
             counterparty: Some("Client".to_string()),
             counterparty_address: None,
             signature: "sig-in".to_string(),
@@ -879,6 +961,7 @@ mod tests {
             kind: EventKind::Expense,
             amount_base_units: 1_000_000,
             mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            decimals: 6,
             counterparty: Some("Vendor".to_string()),
             counterparty_address: None,
             signature: "sig-pay".to_string(),
@@ -919,6 +1002,7 @@ mod tests {
             kind: EventKind::Expense,
             amount_base_units: 1_000_000_000,
             mint: crate::ledger::NATIVE_SOL_MINT.to_string(),
+            decimals: 9,
             counterparty: Some("Jupiter".to_string()),
             counterparty_address: None,
             signature: "sig-swap".to_string(),
@@ -929,6 +1013,7 @@ mod tests {
             kind: EventKind::Income,
             amount_base_units: 10_000_000,
             mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            decimals: 6,
             counterparty: Some("Jupiter".to_string()),
             counterparty_address: None,
             signature: "sig-swap".to_string(),

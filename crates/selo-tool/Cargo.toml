@@ -17,3 +17,4 @@ sha2 = "0.10"
 bs58 = "0.5"
 dotenvy = "0.15"
 clap = { version = "4.4", features = ["derive", "env"] }
+qrcode = "0.14.1"

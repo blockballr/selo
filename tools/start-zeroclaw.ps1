@@ -49,7 +49,7 @@ Write-Host "Loaded $loaded variables from $EnvFile"
 switch ($Mode.ToLower()) {
     "status" {
         & $ZeroClaw.Source config list --filter channels.telegram 2>&1 | Select-String "bot_token"
-        & $ZeroClaw.Source config list --filter providers.models.gemini 2>&1 | Select-String "api_key|model"
+        & $ZeroClaw.Source config list --filter providers.models.opencode 2>&1 | Select-String "api_key|model"
         & $ZeroClaw.Source security status --agent selo 2>&1
     }
     "daemon" {

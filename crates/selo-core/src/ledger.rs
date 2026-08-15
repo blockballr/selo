@@ -31,16 +31,35 @@ pub fn decimals_for_symbol(symbol: &str) -> u32 {
     }
 }
 
+/// Decimals for a mint as recorded by its ledger events, falling back to
+/// the symbol table when the mint was never observed with a balance entry.
+pub fn decimals_for_event(events: &[LedgerEvent], mint: &str) -> u32 {
+    events
+        .iter()
+        .find(|e| e.mint == mint)
+        .map(|e| e.decimals as u32)
+        .unwrap_or_else(|| decimals_for_symbol(mint_to_symbol(mint)))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LedgerEvent {
     pub block_time_unix: Option<i64>,
     pub kind: EventKind,
     pub amount_base_units: i128,
     pub mint: String,
+    /// Decimals of the mint at the time the delta was read. SOL is 9,
+    /// stablecoins 6, and every other mint carries its own; the book needs
+    /// the real value to price a swap's non-stablecoin leg correctly.
+    #[serde(default = "default_decimals")]
+    pub decimals: u8,
     pub counterparty: Option<String>,
     pub counterparty_address: Option<String>,
     pub signature: String,
     pub is_classified: bool,
+}
+
+fn default_decimals() -> u8 {
+    6
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,6 +259,12 @@ impl<'a, T: RpcSeam> Backfiller<'a, T> {
         let since_ts = since.and_then(parse_date_to_timestamp);
         let before_ts = before.and_then(parse_date_to_timestamp);
 
+        // `since` is a stop condition, not a filter over all time. Signatures
+        // arrive newest-first, so once the oldest entry in a page predates the
+        // bound every later page does too; stop walking the account history.
+        // `before` skips entries newer than the bound but must keep paging to
+        // reach it. Block times come from the pagination response itself, so a
+        // year-scoped backfill never fetches each transaction just to date it.
         loop {
             if let Some(l) = effective_limit {
                 if all_signatures.len() >= l {
@@ -252,41 +277,49 @@ impl<'a, T: RpcSeam> Backfiller<'a, T> {
                 None => 1000,
             };
 
-            let batch =
-                self.rpc
-                    .get_signatures_paginated(address, before_sig.as_deref(), batch_size)?;
+            let batch = self.rpc.get_signatures_paginated_with_time(
+                address,
+                before_sig.as_deref(),
+                batch_size,
+            )?;
             if batch.is_empty() {
                 break;
             }
 
             let last_sig = match batch.last() {
-                Some(sig) => sig.clone(),
+                Some((sig, _)) => sig.clone(),
                 None => break,
             };
 
             if since_ts.is_some() || before_ts.is_some() {
-                for sig in batch {
+                let mut past_since_bound = false;
+                for (sig, bt) in batch {
                     let mut include = true;
-                    if let Ok(tx_data) = self.rpc.get_transaction(&sig) {
-                        if let Some(bt) = tx_data.get("blockTime").and_then(|v| v.as_i64()) {
-                            if let Some(s) = since_ts {
-                                if bt < s {
-                                    include = false;
-                                }
+                    if let Some(bt) = bt {
+                        if let Some(s) = since_ts {
+                            if bt < s {
+                                include = false;
+                                past_since_bound = true;
                             }
-                            if let Some(b) = before_ts {
-                                if bt > b {
-                                    include = false;
-                                }
+                        }
+                        if let Some(b) = before_ts {
+                            if bt > b {
+                                include = false;
                             }
                         }
                     }
                     if include {
                         all_signatures.push(sig);
                     }
+                    if past_since_bound {
+                        break;
+                    }
+                }
+                if past_since_bound {
+                    break;
                 }
             } else {
-                all_signatures.extend(batch);
+                all_signatures.extend(batch.into_iter().map(|(sig, _)| sig));
             }
 
             before_sig = Some(last_sig);
@@ -453,15 +486,6 @@ pub fn parse_transaction_events(
         None => return events,
     };
 
-    // Allowed asset mints: SOL, USDC, USDT, PYUSD/USDG
-    let allowed_mints = [
-        NATIVE_SOL_MINT,
-        "So11111111111111111111111111111111111111112",
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
-        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
-        "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo", // PYUSD / USDG
-    ];
-
     // Native SOL Delta
     if let (Some(pre_balances), Some(post_balances)) = (
         meta.get("preBalances").and_then(|v| v.as_array()),
@@ -500,6 +524,7 @@ pub fn parse_transaction_events(
                     kind,
                     amount_base_units: net_delta.abs(),
                     mint: NATIVE_SOL_MINT.to_string(),
+                    decimals: 9,
                     counterparty: primary_counterparty_label.clone(),
                     counterparty_address: primary_counterparty_address.clone(),
                     signature: signature.to_string(),
@@ -513,6 +538,7 @@ pub fn parse_transaction_events(
                     kind: EventKind::FeePaid,
                     amount_base_units: fee,
                     mint: NATIVE_SOL_MINT.to_string(),
+                    decimals: 9,
                     counterparty: Some("Solana Network Fee".to_string()),
                     counterparty_address: Some("11111111111111111111111111111111".to_string()),
                     signature: signature.to_string(),
@@ -522,7 +548,10 @@ pub fn parse_transaction_events(
         }
     }
 
-    // SPL Token Deltas (Strictly filtered to allowed stablecoins & SOL)
+    // SPL Token Deltas (every mint the wallet holds, so swap and LP
+    // positions are visible rather than silently dropped). An unknown token
+    // is tracked under its own mint so distinct assets stay distinct; its
+    // cost basis is resolved separately when the book prices it.
     let empty_vec: Vec<Value> = Vec::new();
     if let (Some(pre), Some(post)) = (meta.get("preTokenBalances"), meta.get("postTokenBalances")) {
         let pre_arr = pre.as_array().unwrap_or(&empty_vec);
@@ -532,18 +561,14 @@ pub fn parse_transaction_events(
         for b in pre_arr {
             if b.get("owner").and_then(|v| v.as_str()) == Some(target_wallet) {
                 if let Some(m) = b.get("mint").and_then(|v| v.as_str()) {
-                    if allowed_mints.contains(&m) {
-                        mints.insert(m.to_string());
-                    }
+                    mints.insert(m.to_string());
                 }
             }
         }
         for b in post_arr {
             if b.get("owner").and_then(|v| v.as_str()) == Some(target_wallet) {
                 if let Some(m) = b.get("mint").and_then(|v| v.as_str()) {
-                    if allowed_mints.contains(&m) {
-                        mints.insert(m.to_string());
-                    }
+                    mints.insert(m.to_string());
                 }
             }
         }
@@ -558,6 +583,18 @@ pub fn parse_transaction_events(
                 .and_then(|a| a.as_str())
                 .and_then(|s| s.parse::<u128>().ok())
                 .unwrap_or(0)
+        };
+
+        let get_decimals = |arr: &Vec<Value>, target_mint: &str| -> u8 {
+            arr.iter()
+                .find(|b| {
+                    b.get("owner").and_then(|v| v.as_str()) == Some(target_wallet)
+                        && b.get("mint").and_then(|v| v.as_str()) == Some(target_mint)
+                })
+                .and_then(|b| b.get("uiTokenAmount").and_then(|a| a.get("decimals")))
+                .and_then(|a| a.as_u64())
+                .and_then(|d| u8::try_from(d).ok())
+                .unwrap_or(6)
         };
 
         for mint in mints {
@@ -580,11 +617,14 @@ pub fn parse_transaction_events(
                     }
                 };
 
+                let decimals = get_decimals(pre_arr, &mint).max(get_decimals(post_arr, &mint));
+
                 events.push(LedgerEvent {
                     block_time_unix: block_time,
                     kind,
                     amount_base_units: delta.abs(),
                     mint,
+                    decimals,
                     counterparty: primary_counterparty_label.clone(),
                     counterparty_address: primary_counterparty_address.clone(),
                     signature: signature.to_string(),
@@ -608,6 +648,7 @@ mod tests {
             kind: EventKind::Income,
             amount_base_units: 100,
             mint: NATIVE_SOL_MINT.to_string(),
+            decimals: 9,
             counterparty: Some("Test Counterparty".to_string()),
             counterparty_address: Some("11111111111111111111111111111111".to_string()),
             signature: "sig_123".to_string(),

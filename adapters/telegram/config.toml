@@ -3,11 +3,16 @@
 # config.local.toml (also gitignored via *.local.toml rule).
 
 [selo]
-# Directory where selo-tool runs (state files land here).
-data_dir = "adapters/telegram/data"
+# Directory where selo-tool runs. Defaults to the repo root so the adapter,
+# the CLI, and the ZeroClaw agent share the same .selo_* state files.
+# Override with the SELO_DATA_DIR environment variable.
+data_dir = ""
 
 [merchant]
-# Default merchant pubkey used by scheduled close and issue SOPs.
+# Tracked wallets are read from the persisted merchant config
+# (.selo_merchant.json in selo-tool's working directory), set with
+# selo-tool merchant --set. SELO_MERCHANT env is a fallback for operators
+# who have not adopted the merchant config yet.
 pubkey = ""
 # Fiscal year for report generation.
 year = "2026"

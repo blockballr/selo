@@ -38,12 +38,17 @@ Environment variables:
 | `TELEGRAM_ADMIN_IDS` | No | Comma-separated chat IDs allowed to run destructive commands |
 | `TELEGRAM_ALERTS_TO` | No | Comma-separated chat IDs that receive settlement and scheduled-job alerts |
 | `SELO_PATH` | Yes | Path to the selo-tool release binary |
-| `SELO_MERCHANT` | No | Default merchant pubkey for scheduled close and reconciliation |
-| `SELO_DATA_DIR` | No | Directory where selo-tool state files live (default: `adapters/telegram/data`) |
+| `SELO_MERCHANT` | No | Fallback merchant pubkey when no merchant config exists |
+| `SELO_DATA_DIR` | No | Directory where selo-tool state files live (default: the repo root, so the adapter, CLI, and agent share one set of `.selo_*` files) |
 | `SELO_FISCAL_YEAR` | No | Fiscal year for report generation (default: `2026`) |
 | `SELO_RECONCILIATION_SECS` | No | Settlement check interval (default: `60`) |
 | `HELIUS_API_KEY` | No | Helius RPC API key for dedicated Solana access |
 | `SOLANA_RPC_URL` | No | Override the default mainnet RPC endpoint |
+
+Tracked wallets come from the persisted merchant config, set with
+`selo-tool merchant --set <pubkey> --name <label>`. The daily close and monthly
+reconciliation follow every tracked wallet; `SELO_MERCHANT` is only a fallback
+for operators who have not configured a merchant yet.
 
 Per-machine overrides can go in `adapters/telegram/config.local.toml` (already
 gitignored via the `*.local.toml` rule in `.gitignore`).
@@ -52,9 +57,9 @@ gitignored via the `*.local.toml` rule in `.gitignore`).
 
 | Job | Schedule | What it does |
 |---|---|---|
-| Daily close | 23:00 local | Runs `close` for the configured merchant, extracts the Poseidon commitment, pushes the anchor memo, and generates an HTML audit report |
+| Daily close | 23:00 local | Runs `close` for every tracked wallet, extracts each Poseidon commitment, pushes the anchor memo, and generates an HTML audit report |
 | Health check | Hourly | Runs `check` and pushes store status (if there are pending quotes) |
-| Monthly reconciliation | 1st, 06:00 | Ingests recent transactions, runs `review` for unclassified counterparties, exports a scoped HTML report, and flags items needing operator review |
+| Monthly reconciliation | 1st, 06:00 | Ingests recent transactions per tracked wallet, runs `review` for unclassified counterparties, exports a scoped HTML report, and flags items needing operator review |
 
 If APScheduler is not installed, scheduling falls back to a simple
 reconciliation loop that runs `confirm` on the configured interval.
@@ -69,5 +74,5 @@ accidental anchors from a misfired command.
 WhatsApp integration is dispatched through ZeroClaw's webhook server to the
 selo skill (`skills/selo/SKILL.toml`). It requires a Meta Cloud API account, a
 public webhook URL, and the ZeroClaw runtime; the in-repo verification for the
-selo skill is `skills/selo/TEST.ps1` (or `TEST.sh`), which runs the workspace
-test suite.
+selo skill is `tools/selo-skill-TEST.ps1` (or `selo-skill-TEST.sh`), which runs
+the workspace test suite.

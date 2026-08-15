@@ -25,13 +25,21 @@ skill_bundles = ["selo"]
 risk_profile = "selo-safe"
 model_provider = "gemini.default"
 
+# The agent workspace doubles as the selo-tool working directory: state files
+# (.selo_store.json, .selo_rules.json, .selo_ledger_*.json, .env) resolve from
+# here, and the skill shell tools run in it. Must match the operator's data dir.
+[agents.selo.workspace]
+path = "C:\\Users\\user\\Desktop\\selo"
+
 [risk_profiles.selo-safe]
 allowed_commands = ["selo-tool"]
 allowed_roots = ["C:\\Users\\user\\Desktop\\selo", "C:\\Users\\user\\.zeroclaw\\data"]
-always_ask = ["close", "anchor"]
+# Skill tools are registered under composed names (<skill>__<tool>), so the
+# close-prep commands must be named selo__close / selo__anchor here.
+always_ask = ["selo__close", "selo__anchor"]
 
 [skill_bundles.selo]
-directory = 'C:\Users\user\.zeroclaw\shared\skills\selo'
+directory = 'C:\Users\user\Desktop\selo\skills'
 
 [channels.telegram.primary]
 enabled = true

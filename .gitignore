@@ -20,3 +20,6 @@ __pycache__/
 *.local.toml
 config.local.*
 tax_ledger.json
+
+# Build log is a private working record, not repo content.
+buildlog.md

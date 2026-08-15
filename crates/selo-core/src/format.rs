@@ -11,6 +11,45 @@ use std::collections::BTreeMap;
 
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
+/// Parse a human-written SOL amount ("0.5", "1", "2.25") into lamports.
+/// Rejects values that do not land on a whole lamport or that overflow.
+pub fn sol_to_lamports(sol: &str) -> Result<u64, String> {
+    let s = sol.trim();
+    if s.is_empty() {
+        return Err("empty SOL amount".to_string());
+    }
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    if frac.len() > 9 {
+        return Err(format!(
+            "SOL amount '{s}' has more than 9 decimal places; the smallest unit is a lamport"
+        ));
+    }
+    let whole_u: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u64>()
+            .map_err(|_| format!("'{s}' is not a valid SOL amount"))?
+    };
+    let frac_u: u64 = if frac.is_empty() {
+        0
+    } else {
+        frac.parse::<u64>()
+            .map_err(|_| format!("'{s}' is not a valid SOL amount"))?
+    };
+    let frac_lamports = frac_u
+        .checked_mul(10u64.pow((9 - frac.len()) as u32))
+        .ok_or_else(|| format!("SOL amount '{s}' overflows"))?;
+    let lamports = whole_u
+        .checked_mul(LAMPORTS_PER_SOL)
+        .and_then(|w| w.checked_add(frac_lamports))
+        .ok_or_else(|| format!("SOL amount '{s}' overflows lamports"))?;
+    Ok(lamports)
+}
+
 /// Render lamports as a SOL decimal string with trailing zeros trimmed.
 pub fn lamports_to_sol(lamports: u64) -> String {
     let whole = lamports / LAMPORTS_PER_SOL;
@@ -640,10 +679,11 @@ impl TaxLedger {
 
         let mut sorted_years: Vec<String> = year_month_groups.keys().cloned().collect();
         sorted_years.sort();
-        sorted_years.reverse();
 
-        // The most recent year with data, or the fallback if no data exists.
-        let current_calendar_year = sorted_years.first().cloned().unwrap_or_else(|| fallback_year.to_string());
+        // Oldest year first (top), most recent year last (bottom), so the
+        // sealed closed years read top-down and the open current period sits
+        // at the end of the stack.
+        let current_calendar_year = sorted_years.last().cloned().unwrap_or_else(|| fallback_year.to_string());
 
         for target_yr in &sorted_years {
             let months_in_year = year_month_groups.get(target_yr).unwrap();
@@ -741,7 +781,7 @@ impl TaxLedger {
                         <div class="accordion-content">
                             <table>
                                 <thead>
-                                    <tr><th>PERIOD CODE</th><th>ASSET CLASS</th><th>TOTAL VOLUME</th><th>CUMULATIVE COST BASIS (BRL)</th><th>PTAX RATE</th><th>INTERVAL UTC</th></tr>
+                                    <tr><th>PERIOD CODE</th><th>ASSET CLASS</th><th>TOTAL VOLUME</th><th>CUMULATIVE COST BASIS (BRL)</th><th>RATE USED (BRL/UNIT)</th><th>INTERVAL UTC</th></tr>
                                 </thead>
                                 <tbody>
                                     <tr>
@@ -750,8 +790,7 @@ impl TaxLedger {
                                         <td>{receipt_count} receipts</td>
                                         <td>R$ {month_cost_brl:.2}</td>
                                         <td>R$ {avg_ptax:.4} (Avg)</td>
-                                        <td>{sample_date}</td>
-                                    </tr>
+                                        <td>{sample_date}</td>                                    </tr>
                                 </tbody>
                             </table>
                         </div>
@@ -769,7 +808,7 @@ impl TaxLedger {
                         <div class="accordion-content">
                             <table>
                                 <thead>
-                                    <tr><th>PERIOD CODE</th><th>ASSET CLASS</th><th>TOTAL VOLUME</th><th>CUMULATIVE COST BASIS (BRL)</th><th>PTAX RATE</th><th>INTERVAL UTC</th></tr>
+                                    <tr><th>PERIOD CODE</th><th>ASSET CLASS</th><th>TOTAL VOLUME</th><th>CUMULATIVE COST BASIS (BRL)</th><th>RATE USED (BRL/UNIT)</th><th>INTERVAL UTC</th></tr>
                                 </thead>
                                 <tbody>
                                     <tr><td colspan="6" style="text-align: center; color: var(--selo-muted);">No transactions recorded for this month.</td></tr>
@@ -812,12 +851,24 @@ impl TaxLedger {
                 "January", "February", "March", "April", "May", "June",
                 "July", "August", "September", "October", "November", "December",
             ];
+            let year_records: Vec<&GainRecord> = self
+                .gain_records
+                .iter()
+                .filter(|g| g.date_ymd.starts_with(target_yr.as_str()))
+                .collect();
+            let year_net_total: f64 = year_records.iter().map(|g| g.gain_brl).sum();
+            let year_net_total_usd: f64 = year_records.iter().map(|g| g.gain_usd).sum();
+            let year_tax_brl: f64 = if year_net_total > 0.0 {
+                year_net_total * 0.15
+            } else {
+                0.0
+            };
+            let year_tax_usd: f64 = if year_net_total_usd > 0.0 {
+                year_net_total_usd * 0.15
+            } else {
+                0.0
+            };
             let year_gains_html = {
-                let year_records: Vec<&GainRecord> = self
-                    .gain_records
-                    .iter()
-                    .filter(|g| g.date_ymd.starts_with(target_yr.as_str()))
-                    .collect();
                 if year_records.is_empty() {
                     String::new()
                 } else {
@@ -935,9 +986,23 @@ impl TaxLedger {
                 }
             };
 
-            let is_current_year = target_yr.as_str() == current_calendar_year.as_str();
-            let year_expanded_class = if is_current_year { "expanded" } else { "" };
-            let year_content_display = if is_current_year { "block" } else { "none" };
+            // All accordions start closed; the current year is still flagged
+            // as the open period via the status badge but stays collapsed.
+            let year_expanded_class = "";
+            let year_content_display = "none";
+
+            let year_tax_badge = if year_records.is_empty() {
+                String::new()
+            } else if year_tax_brl > 0.0 {
+                format!(
+                    r#"<span style="padding:2px 10px;border:1px solid var(--wax-badge);border-radius:6px;font:600 12px/1.3 var(--selo-font-mono);color:var(--wax-badge);white-space:nowrap;">Tax Due R$ {:.2}<span style="font-weight:400;margin-left:4px;">${:.2}</span></span>"#,
+                    year_tax_brl, year_tax_usd
+                )
+            } else {
+                format!(
+                    r#"<span style="padding:2px 10px;border:1px solid var(--selo-rule);border-radius:6px;font:600 12px/1.3 var(--selo-font-mono);color:var(--selo-muted);white-space:nowrap;">No tax due</span>"#,
+                )
+            };
 
             fiscal_years_html.push_str(&format!(
                 r#"
@@ -948,6 +1013,7 @@ impl TaxLedger {
                             <div class="v" style="margin:2px 0 0;">{year_receipt_count} receipts &middot; R$ {year_cost_brl:.2}</div>
                         </div>
                         <div style="display:flex; align-items:center; gap:16px;">
+                            {year_tax_badge}
                             {year_status_html}
                             <span class="chevron">&#9662;</span>
                         </div>
@@ -955,9 +1021,9 @@ impl TaxLedger {
                     <div class="accordion-content" style="display: {year_content_display}; padding: 16px;">
                         <div style="margin-bottom: 16px;">
                             <div class="k" style="margin-bottom:6px;">Cryptographic State Root (Poseidon BN254 Commitment)</div>
-                            <div style="display:flex; justify-content:space-between; align-items:center; background:var(--selo-raised); padding:10px 14px; border-radius:8px; border:1px solid var(--selo-rule);">
-                                <span style="font: 600 12px/1.4 var(--selo-font-mono); word-break:break-all;">{state_root}</span>
-                                <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+                            <div class="root-row" style="display:flex; justify-content:space-between; align-items:center; background:var(--selo-raised); padding:10px 14px; border-radius:8px; border:1px solid var(--selo-rule);">
+                                <span class="root-hash" style="font: 600 12px/1.4 var(--selo-font-mono); word-break:break-all;">{state_root}</span>
+                                <div class="root-buttons" style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
                                     <button class="copy-btn" onclick="copyToClipboard('{state_root}', this)">Copy Root</button>
                                     {year_verify_html}
                                 </div>
@@ -974,6 +1040,7 @@ impl TaxLedger {
                 year_receipt_count = year_receipt_count,
                 year_cost_brl = year_cost_brl,
                 year_status_html = year_status_html,
+                year_tax_badge = year_tax_badge,
                 year_expanded_class = year_expanded_class,
                 year_content_display = year_content_display,
                 state_root = state_root,
@@ -1046,6 +1113,7 @@ impl TaxLedger {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20128%20128%22%20width%3D%2232%22%20height%3D%2232%22%3E%3Cdefs%3E%3CclipPath%20id%3D%22fav%22%3E%3Ccircle%20cx%3D%2264%22%20cy%3D%2264%22%20r%3D%2250%22%2F%3E%3C%2FclipPath%3E%3C%2Fdefs%3E%3Cg%20clip-path%3D%22url%28%23fav%29%22%3E%3Cpath%20fill%3D%22%2316130F%22%20d%3D%22M64%200H128V128H64Z%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%2264%22%20cy%3D%2264%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%2316130F%22%20stroke-width%3D%2213%22%2F%3E%3C%2Fsvg%3E">
 <title>Selo · Cryptographic Audit Statement{title_suffix}</title>
 <style>
   :root {{
@@ -1061,17 +1129,15 @@ impl TaxLedger {
     --selo-font-sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
     --selo-font-mono: ui-monospace, "JetBrains Mono", Consolas, monospace;
   }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --selo-ink: #F2EDE5;
-      --selo-paper: #14120F;
-      --selo-muted: #9A8F83;
-      --selo-rule: #2E2A25;
-      --selo-raised: #1D1A16;
-      --wax: #F2EDE5;
-      --wax-badge: #B4381F;
-      --green: #3FB950;
-    }}
+  html[data-theme="dark"] {{
+    --selo-ink: #F2EDE5;
+    --selo-paper: #14120F;
+    --selo-muted: #9A8F83;
+    --selo-rule: #2E2A25;
+    --selo-raised: #1D1A16;
+    --wax: #F2EDE5;
+    --wax-badge: #B4381F;
+    --green: #3FB950;
   }}
   * {{ box-sizing: border-box; scroll-behavior: smooth; }}
   body {{
@@ -1085,6 +1151,19 @@ impl TaxLedger {
   .logo-box {{ width: 42px; height: 42px; background: var(--selo-rule); border-radius: 10px; padding: 8px; display: flex; align-items: center; justify-content: center; }}
   .logo-box svg {{ width: 100%; height: 100%; fill: var(--selo-ink); }}
   h1 {{ font-size: 28px; letter-spacing: -.03em; margin: 0; }}
+  .theme-toggle {{
+    margin-left: auto;
+    background: var(--selo-raised);
+    border: 1px solid var(--selo-rule);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font: 600 11px/1 var(--selo-font-sans);
+    color: var(--selo-ink);
+    cursor: pointer;
+    letter-spacing: .04em;
+    transition: background 0.2s;
+  }}
+  .theme-toggle:hover {{ background: var(--selo-rule); }}
   p.lede {{ font-size: 15px; color: var(--selo-muted); margin: 0 0 32px; max-width: 65ch; }}
 
   .card {{
@@ -1156,6 +1235,21 @@ impl TaxLedger {
   .gain-negative {{ color: var(--wax); font-weight: 600; }}
   .usd {{ font-size: 11px; color: var(--selo-muted); font-weight: 400; }}
 
+  @media (max-width: 600px) {{
+    body {{ padding: 24px 12px 80px; }}
+    .header-area {{ flex-wrap: wrap; }}
+    h1 {{ font-size: 22px; }}
+    .accordion-header {{ flex-direction: column; align-items: flex-start; gap: 10px; }}
+    .accordion-content {{ padding: 0 12px 16px; }}
+    .root-row {{
+      flex-direction: column !important;
+      align-items: stretch !important;
+      gap: 10px;
+    }}
+    .root-buttons {{ width: 100%; flex-wrap: wrap; }}
+    th, td {{ padding: 8px 6px; font-size: 11px; }}
+  }}
+
   footer {{ margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--selo-rule); color: var(--selo-muted); font-size: 12px; }}
 </style>
 </head>
@@ -1166,6 +1260,7 @@ impl TaxLedger {
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><defs><clipPath id="hb"><circle cx="64" cy="64" r="52"/></clipPath></defs><g clip-path="url(#hb)"><path d="M64 0H128V128H64Z"/><g stroke="currentColor" stroke-width="7"><line x1="0" y1="37" x2="55" y2="37"/><line x1="0" y1="55" x2="55" y2="55"/><line x1="0" y1="73" x2="55" y2="73"/><line x1="0" y1="91" x2="55" y2="91"/></g></g><circle cx="64" cy="64" r="52" fill="none" stroke="currentColor" stroke-width="9"/></svg>
     </div>
     <h1>Selo Tax Ledger Report</h1>
+    <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">&#9681; Theme</button>
   </div>
 
   <div id="verify-badge" class="verify-badge checking">
@@ -1173,7 +1268,7 @@ impl TaxLedger {
     <span id="verify-text">Verifying integrity...</span>
   </div>
 
-  <p class="lede">Self-verifying cryptographic audit statement. The integrity badge above recomputes a SHA-256 hash over the embedded lot data and compares it against the hash recorded at export time. The Poseidon BN254 state root is also shown for on-chain anchoring reference, and the Verify in Browser button recomputes it from the embedded lot data.</p>
+  <p class="lede">Self-verifying cryptographic audit statement. The integrity badge above recomputes a SHA-256 hash over the embedded lot data and compares it against the hash recorded at export time. The Poseidon BN254 state root is shown so it can be checked against an on-chain anchor, and the Verify in Browser button recomputes it from the embedded lot data.</p>
 
   <div class="card">
     <div class="k">Ledger Cumulative Summary</div>
@@ -1202,6 +1297,23 @@ impl TaxLedger {
     var badge = document.getElementById('verify-badge');
     var icon = document.getElementById('verify-icon');
     var text = document.getElementById('verify-text');
+
+    function toggleTheme() {{
+      var html = document.documentElement;
+      var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+      try {{ localStorage.setItem('selo-theme', next); }} catch (e) {{}}
+    }}
+    window.toggleTheme = toggleTheme;
+    (function initTheme() {{
+      var saved = null;
+      try {{ saved = localStorage.getItem('selo-theme'); }} catch (e) {{}}
+      if (saved === 'dark' || saved === 'light') {{
+        document.documentElement.setAttribute('data-theme', saved);
+      }} else {{
+        document.documentElement.setAttribute('data-theme', 'light');
+      }}
+    }})();
 
     var dataEl = document.getElementById('selo-verification-data');
     if (!dataEl) {{

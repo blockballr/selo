@@ -26,6 +26,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+# Load the repo's .env so the adapter and the CLI/agent share one source of
+# secrets and one state directory. The repo root is two levels above this
+# file (adapters/telegram/main.py).
+try:
+    from dotenv import load_dotenv
+
+    _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+    load_dotenv(_REPO_ROOT / ".env")
+except ImportError:
+    _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
 # Optional: APScheduler for built-in cron. Falls back to simple sleep-loop
 # scheduling when not installed, so the adapter remains runnable without it.
 try:
@@ -52,7 +63,10 @@ ALERT_IDS = [
     for x in os.environ.get("TELEGRAM_ALERTS_TO", "").split(",")
     if x.strip()
 ]
-DATA_DIR = Path(os.environ.get("SELO_DATA_DIR", "adapters/telegram/data"))
+# State lives in the repo root by default, so the adapter, the CLI, and the
+# ZeroClaw agent all read and write the same .selo_* files. Override with
+# SELO_DATA_DIR only when a machine genuinely needs isolated state.
+DATA_DIR = Path(os.environ.get("SELO_DATA_DIR", str(_REPO_ROOT)))
 RECONCILIATION_INTERVAL = int(
     os.environ.get("SELO_RECONCILIATION_SECS", "60")
 )
@@ -173,7 +187,7 @@ def run_selo_pretty(args: list[str], timeout: int = 300) -> str:
     """Run selo-tool and pretty-print JSON output in a code fence."""
     rc, out = run_selo(args, timeout)
     if rc != 0:
-        return f"Error (exit {rc}):\n```\n{out[:2000]}\n```"
+        return _friendly_error(out)
     # Try prettifying JSON.
     try:
         parsed = json.loads(out)
@@ -313,9 +327,11 @@ def dispatch(chat_id: int, text: str) -> Optional[str]:
         _, check_out = run_selo(["check"])
         state = load_state()
         settled_count = len(state.get("settled_signatures", {}))
+        ingest_note = "Running" if chat_id in _jobs else "Idle"
         return (
             f"*Selo Status*\n\n{check_out}\n\n"
             f"Watcher: running (interval {RECONCILIATION_INTERVAL}s)\n"
+            f"Ingestion: {ingest_note}\n"
             f"Known settled signatures: {settled_count}\n"
             f"Alert chats: {len(ALERT_IDS)}\n"
         )
@@ -350,19 +366,11 @@ def dispatch(chat_id: int, text: str) -> Optional[str]:
     if cmd in cmd_map:
         return run_selo_pretty(cmd_map[cmd])
 
-    # ---- Long-running ingest (streamed) ----
+    # ---- Long-running ingest (background, non-blocking) ----
     if cmd == "ingest":
         if not is_admin(chat_id):
             return "Ingestion requires admin authorization."
-        send_telegram(chat_id, f"Starting ingestion: `selo-tool ingest {' '.join(args)}`")
-        output = run_selo_streaming(["ingest"] + args, chat_id, timeout=600)
-        if output:
-            # Show summary lines at the end.
-            summary_lines = [ln for ln in output.splitlines() if "Summary" in ln or "Events" in ln or "classified" in ln or "review" in ln]
-            if summary_lines:
-                return "```\n" + "\n".join(summary_lines[:30]) + "\n```"
-            return f"```\n{output[:2000]}\n```"
-        return "Ingestion complete."
+        return _start_ingest(chat_id, args)
 
     # ---- export-html (gated, produces file) ----
     if cmd in ("export-html", "exporthtml"):
@@ -417,7 +425,8 @@ def _handle_confirm(chat_id: int, args: list[str]) -> Optional[str]:
         return "This confirmation token belongs to a different chat."
     if time.time() > expires:
         return "Confirmation token expired. Issue the command again."
-    return run_selo_pretty(cmd_args)
+    result = run_selo_pretty(cmd_args)
+    return result
 
 
 # ---- Argument parser that respects quoted strings ----
@@ -429,6 +438,120 @@ def _parse_args(args_str: str) -> list[str]:
         return shlex.split(args_str)
     except ValueError:
         return args_str.split()
+
+
+# ---- Plain-language error translation ----
+# Telegram operators are assumed non-technical, so raw Rust stack traces,
+# RPC JSON, and exit codes are replaced with a short, actionable line. The
+# underlying detail stays in the process log, not in the chat.
+
+def _friendly_error(out: str) -> str:
+    """Turn selo-tool failure output into a plain sentence."""
+    if not out:
+        return "Something went wrong, but the tool did not explain why. Please try again."
+    low = out.lower()
+    if "timed out" in low:
+        return "The operation took too long and was stopped. Try a smaller date range."
+    if "rpc error" in low or "transport error" in low:
+        return "The Solana network was unreachable. Check the connection and try again."
+    if "not a valid" in low or "wrong size" in low:
+        return "That address does not look like a valid Solana wallet. Check it and try again."
+    if "no ledger" in low or "not found" in low:
+        return "There is no saved ledger for that wallet yet. Run ingest first."
+    if "not configured" in low or "unconfigured" in low:
+        return "No wallet is set up yet. Run /merchant or use /start."
+    if "not allowed" in low or "not permitted" in low:
+        return "This action is not allowed from this chat."
+    # Fall back to the first meaningful line, stripped of noise.
+    clean = [ln for ln in out.splitlines() if ln.strip() and not ln.startswith("DEBUG:")]
+    if clean:
+        first = clean[0].strip()
+        if len(first) > 200:
+            first = first[:200] + "..."
+        return f"That could not be completed: {first}"
+    return "That could not be completed. Please try again."
+
+
+# ---- Background jobs (ingest runs without blocking other commands) ----
+
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+
+
+def _start_ingest(chat_id: int, args: list[str]) -> str:
+    """Launch ingest on a worker thread and return an immediate ack."""
+    with _jobs_lock:
+        if chat_id in _jobs:
+            return "An ingestion is already running. Wait for it to finish or ask for /status."
+        _jobs[chat_id] = {"kind": "ingest", "done": False}
+
+    def worker():
+        try:
+            _stream_ingest(chat_id, args)
+        finally:
+            with _jobs_lock:
+                _jobs.pop(chat_id, None)
+
+    threading.Thread(target=worker, daemon=True, name=f"ingest-{chat_id}").start()
+    return "Ingestion started in the background. I will post progress here. You can keep using other commands."
+
+
+def _stream_ingest(chat_id: int, args: list[str]):
+    """Run ingest, parsing SELO_PROGRESS lines into friendly progress posts."""
+    selo_path = SELO_PATH
+    if sys.platform == "win32" and not os.path.exists(selo_path):
+        if os.path.exists(selo_path + ".exe"):
+            selo_path = selo_path + ".exe"
+
+    cmd = [selo_path, "ingest"] + args
+    logging.info("ingest worker: %s", " ".join(cmd))
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(DATA_DIR),
+        )
+    except FileNotFoundError:
+        send_telegram(chat_id, f"selo-tool binary not found at '{selo_path}'.")
+        return
+
+    summary: list[str] = []
+    last_progress_sent = 0.0
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n").rstrip("\r")
+            if not line or line.startswith("DEBUG:"):
+                continue
+            m = re.match(r"SELO_PROGRESS (\d+)/(\d+) \(([\d.]+)%\) ~([\d.]+)/s ETA (\d+)s", line)
+            if m:
+                done, total, pct, rate, eta = m.groups()
+                now = time.time()
+                if now - last_progress_sent >= 15 or done == total:
+                    last_progress_sent = now
+                    eta_min = int(eta) // 60
+                    eta_s = int(eta) % 60
+                    eta_txt = f"{eta_min}m {eta_s}s" if eta_min else f"{eta_s}s"
+                    send_telegram(
+                        chat_id,
+                        f"Ingesting: {done}/{total} signatures ({pct}%)\n"
+                        f"About {eta_txt} remaining.",
+                    )
+                continue
+            # Keep the useful end-of-run lines for the summary.
+            if any(k in line for k in ("Summary", "Events", "classified", "review", "Tax lots")):
+                summary.append(line)
+        proc.wait()
+        if proc.returncode != 0:
+            send_telegram(chat_id, _friendly_error("".join(summary)))
+        elif summary:
+            send_telegram(chat_id, "Ingestion complete.\n" + "\n".join(summary[-20:]))
+        else:
+            send_telegram(chat_id, "Ingestion complete.")
+    except Exception as e:
+        logging.error("ingest worker error: %s", e)
+        send_telegram(chat_id, _friendly_error(str(e)))
 
 
 # ---------------------------------------------------------------------------
@@ -478,21 +601,39 @@ def settlement_watcher(stop_event: threading.Event):
 # ---------------------------------------------------------------------------
 
 
+def tracked_wallets() -> list[str]:
+    """Wallets the daily close and reconciliation should follow.
+
+    Reads the persisted merchant config through selo-tool merchant, so the
+    cron follows the same tracked wallets the operator configured rather than
+    a single SELO_MERCHANT env var. Falls back to SELO_MERCHANT for operators
+    who have not adopted the merchant config yet.
+    """
+    rc, out = run_selo(["merchant"], timeout=15)
+    if rc == 0:
+        pubs = re.findall(r"^\s*(?:primary|tracked)\s+(\S{32,44})", out, re.MULTILINE)
+        if pubs:
+            return pubs
+    if MERCHANT_PUBKEY:
+        return [MERCHANT_PUBKEY]
+    return []
+
+
 def daily_close_job():
     """Scheduled daily close: build close, verify root, push report."""
-    if not MERCHANT_PUBKEY:
-        logging.warning("Daily close skipped: SELO_MERCHANT not configured.")
+    wallets = tracked_wallets()
+    if not wallets:
+        logging.warning("Daily close skipped: no tracked wallets configured.")
         return
     now = int(time.time())
     day_start = now - (now % 86400)
     day_end = day_start + 86400
     year = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y")
 
-    logging.info("Running daily close for %s: %d to %d", MERCHANT_PUBKEY, day_start, day_end)
+    logging.info("Running daily close for %d wallet(s): %d to %d", len(wallets), day_start, day_end)
     rc, out = run_selo(
         [
             "close",
-            "--merchant", MERCHANT_PUBKEY,
             "--start", str(day_start),
             "--end", str(day_end),
             "--output", str(DATA_DIR / "close_record.txt"),
@@ -500,10 +641,11 @@ def daily_close_job():
         timeout=120,
     )
     if rc == 0:
-        # Extract commitment from output.
-        m = re.search(r"Commitment Base58:\s*(\S+)", out)
-        root = m.group(1) if m else "unknown"
-        alert_all(f"Daily close anchored.\nPoseidon commitment: `{root}`")
+        # Extract every commitment from a multi-wallet close, or the one from
+        # a single-wallet close.
+        roots = re.findall(r"Commitment Base58:\s*(\S+)", out)
+        root_list = "\n".join(f"`{r}`" for r in roots) if roots else "unknown"
+        alert_all(f"Daily close anchored.\nPoseidon commitment(s):\n{root_list}")
 
         # Generate HTML report.
         rc2, _ = run_selo(
@@ -531,41 +673,45 @@ def health_check_job():
 
 def monthly_reconciliation_job():
     """Monthly full reconciliation: ingest recent, review, export report."""
-    if not MERCHANT_PUBKEY:
+    wallets = tracked_wallets()
+    if not wallets:
         return
     now = datetime.fromtimestamp(time.time(), tz=timezone.utc)
     month_start = now.replace(day=1, hour=0, minute=0, second=0).strftime("%Y-%m-%d")
     year = now.strftime("%Y")
 
-    alert_all(f"Monthly reconciliation started for {MERCHANT_PUBKEY}.")
-    rc, out = run_selo(
-        [
-            "ingest", MERCHANT_PUBKEY,
-            "--since", month_start,
-            "--all",
-        ],
-        timeout=600,
-    )
-    if rc == 0:
-        # Check for unclassified counterparties.
-        rc2, review_out = run_selo(["review", MERCHANT_PUBKEY], timeout=30)
-        needs_review = "Needs Review" in review_out
-        report_path = str(DATA_DIR / f"report_{year}_{now.strftime('%m')}.html")
-        run_selo(
+    alert_all(f"Monthly reconciliation started for {len(wallets)} wallet(s).")
+    needs_review = False
+    for wallet in wallets:
+        rc, out = run_selo(
             [
-                "export-html",
-                "--year", year,
-                "--from", month_start,
-                "--output", report_path,
+                "ingest", wallet,
+                "--since", month_start,
+                "--all",
             ],
-            timeout=60,
+            timeout=600,
         )
-        msg = f"Monthly reconciliation complete.\nReport: `{report_path}`"
-        if needs_review:
-            msg += "\n\n*Action required:* unclassified counterparties need review.\nRun `/review` for details."
-        alert_all(msg)
-    else:
-        alert_all(f"Monthly reconciliation failed:\n```\n{out[:1000]}\n```")
+        if rc != 0:
+            alert_all(f"Reconciliation ingest failed for {wallet}:\n```\n{out[:800]}\n```")
+            continue
+        # Check for unclassified counterparties.
+        rc2, review_out = run_selo(["review", wallet], timeout=30)
+        needs_review = needs_review or "Needs Review" in review_out
+
+    report_path = str(DATA_DIR / f"report_{year}_{now.strftime('%m')}.html")
+    rc2, _ = run_selo(
+        [
+            "export-html",
+            "--year", year,
+            "--from", month_start,
+            "--output", report_path,
+        ],
+        timeout=60,
+    )
+    msg = f"Monthly reconciliation complete.\nReport: `{report_path}`"
+    if needs_review:
+        msg += "\n\n*Action required:* unclassified counterparties need review.\nRun `/review` for details."
+    alert_all(msg)
 
 
 def setup_scheduler(stop_event: threading.Event):
@@ -595,7 +741,7 @@ def setup_scheduler(stop_event: threading.Event):
         coalesce=True,
         max_instances=1,
     )
-    if MERCHANT_PUBKEY:
+    if HAS_APSCHEDULER:
         scheduler.add_job(
             monthly_reconciliation_job,
             CronTrigger.from_crontab("0 6 1 * *"),

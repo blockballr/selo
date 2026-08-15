@@ -1475,6 +1475,7 @@ mod tests {
             kind: EventKind::Revenue,
             amount_base_units: 500,
             mint: USDC.to_string(),
+            decimals: 6,
             counterparty: Some("Customer".to_string()),
             counterparty_address: None,
             signature: "sig1".to_string(),
@@ -1492,6 +1493,7 @@ mod tests {
             kind: EventKind::Payout,
             amount_base_units: -200, // must be negative
             mint: USDC.to_string(),
+            decimals: 6,
             counterparty: Some("Vendor".to_string()),
             counterparty_address: None,
             signature: "sig2".to_string(),
@@ -1514,6 +1516,7 @@ mod tests {
             kind: EventKind::Income, // trigger refusal
             amount_base_units: 1000,
             mint: "USDC".to_string(),
+            decimals: 6,
             counterparty: Some("Client".to_string()),
             counterparty_address: None,
             signature: "sig3".to_string(),
