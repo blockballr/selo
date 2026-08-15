@@ -277,6 +277,21 @@ enum Commands {
         #[arg(long, help = "Target cryptographic Poseidon state root hash")]
         root: String,
     },
+    /// generate an offline Groth16 proof that one daily-close line is committed under its merkle root
+    #[command(
+        about = "Generate and verify an offline Groth16 proof for a daily-close line",
+        after_help = "EXAMPLE:\n  selo-tool prove --merchant <PUBKEY> --start 1750000000 --end 1750086400 --line 2\n\nBuilds the day close from settled quotes, derives the merkle proof for the chosen\nline, and produces a Groth16 proof (over BN254) that the line's leaf is committed\nunder the close's Poseidon merkle root. The proof is verified locally before it is\nshown, so a printed proof is a verified one."
+    )]
+    Prove {
+        #[arg(long, help = "Merchant wallet public key address (defaults to the configured merchant)")]
+        merchant: Option<String>,
+        #[arg(long, help = "Start of day unix timestamp")]
+        start: i64,
+        #[arg(long, help = "End of day unix timestamp")]
+        end: i64,
+        #[arg(long, default_value = "0", help = "Zero-based index of the line to prove")]
+        line: u64,
+    },
     /// list ingested wallet ledgers on disk
     #[command(about = "List ingested wallet ledgers and their lot counts")]
     Wallets,
@@ -401,6 +416,18 @@ fn close_wallets(explicit: Option<&str>, rules: &CounterpartyRegistry) -> Result
         }
     });
     Ok(wallets)
+}
+
+/// Render bytes as a lowercase hex string, mirroring the format the HTML
+/// report uses so proof output matches the rest of the tool.
+fn hex_string(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Map a Solana mint address to a human-readable asset symbol.
@@ -1744,6 +1771,50 @@ fn main() -> Result<(), String> {
                 println!("âœ“ VERIFICATION SUCCESSFUL: Local ledger state cryptographically matches the target root!");
             } else {
                 println!("âœ— VERIFICATION FAILED: Computed root does not match target root. Ledger data may have been altered.");
+            }
+        }
+        Commands::Prove {
+            merchant,
+            start,
+            end,
+            line,
+        } => {
+            let resolved_merchant = close_wallets(merchant.as_deref(), &rules)?;
+            if resolved_merchant.len() > 1 {
+                return Err(
+                    "Prove needs a single merchant wallet; pass --merchant <PUBKEY> explicitly."
+                        .to_string(),
+                );
+            }
+            let merchant = &resolved_merchant[0];
+            let close_record = build_close_from_store(merchant, start, end)?;
+            let statement = selo_core::prove::line_statement(&close_record, line)?;
+            println!("Generating offline Groth16 proof over BN254...");
+            println!("  Merchant        : {}", merchant);
+            println!("  Window          : {} -> {}", start, end);
+            println!("  Line Index      : {}", statement.line_index);
+            println!("  Leaf (hex)      : 0x{}", hex_string(&statement.leaf));
+            println!("  Merkle Root     : 0x{}", hex_string(&statement.root));
+            println!("  Proof Path Depth: {}", statement.proof_path.len());
+            let (pk, vk, proof) = selo_core::prove::prove_inclusion(
+                statement.root,
+                statement.line_index,
+                statement.leaf,
+                statement.proof_path.clone(),
+            )?;
+            let public = selo_core::prove::statement_public_inputs(&statement)?;
+            let bytes = selo_core::prove::serialize_proof(&proof)?;
+            let pk_size = selo_core::prove::proving_key_size(&pk)?;
+            println!("  Proving Key     : {} bytes", pk_size);
+            println!("  Proof Size      : {} bytes", bytes.len());
+            println!("  Public Inputs   : {} (root + {} index bits)", public.len(), statement.proof_path.len());
+            match selo_core::prove::verify_inclusion(&vk, &public, &proof) {
+                Ok(true) => {
+                    println!("  Verification    : OK - the leaf is committed under the root");
+                    println!("  Proof (hex)     : 0x{}", hex_string(&bytes));
+                }
+                Ok(false) => println!("  Verification    : FAILED - proof did not verify locally"),
+                Err(e) => println!("  Verification    : ERROR - {e}"),
             }
         }
         Commands::Wallets => {

@@ -11,6 +11,7 @@ pub mod message;
 pub mod nonce;
 pub mod pda;
 pub mod priority;
+pub mod prove;
 pub mod ptax;
 pub mod quote;
 pub mod quotelog;
