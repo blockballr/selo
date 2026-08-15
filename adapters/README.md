@@ -8,9 +8,16 @@ settlement alerts. The WhatsApp adapter routes through ZeroClaw's webhook server
 
 The Telegram adapter is the main control surface for Selo. It provides:
 
-- **Command routing**: All selo-tool subcommands available via `/` commands,
-  with admin gating for destructive operations and confirm-token gates for
-  close and issue.
+- **Button menu and click-through wizard**: Sending `/start` or `/help` returns
+  an inline-keyboard menu (issue payment, check quotes, confirm settlement,
+  ingest a wallet, balance, daily close, export report, status). Tapping a
+  button launches a guided flow that asks one question at a time and collects
+  the answer from the next message, so a non-technical operator never has to
+  type a full command. Long-running or destructive steps still ask for a
+  confirm-token before they run.
+- **Command routing**: All selo-tool subcommands also available via `/`
+  commands, with admin gating for destructive operations and confirm-token
+  gates for close and issue.
 - **Built-in cron**: Daily close at 23:00, hourly health checks, monthly
   reconciliation on the 1st at 06:00. No external crontab or ZeroClaw trigger
   needed.
@@ -18,7 +25,11 @@ The Telegram adapter is the main control surface for Selo. It provides:
   signature deduplication across restarts. Pushes alerts to configured chat
   IDs when a payment settles on chain.
 - **Progress streaming**: Long-running ingest commands stream progress updates
-  back to the chat so the operator can watch the backfill proceed.
+  back to the chat so the operator can watch the backfill proceed, and they
+  run on a background thread so the operator can keep using other commands
+  while an ingestion is in progress.
+- **Plain-language errors**: Rust stack traces and raw RPC JSON never reach
+  the chat. Failures are translated into short, actionable sentences.
 
 Start it:
 

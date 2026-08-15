@@ -414,7 +414,8 @@ binary.
 
 Channel adapters live in `adapters/`:
 - **Telegram**: a Python long-polling bot that serves as the primary
-  operational interface, with built-in cron scheduling for the daily close and
+  operational interface, with a button menu and click-through wizard for
+  non-technical operators, built-in cron scheduling for the daily close and
   periodic reconciliation, SOP-driven guided workflows, and a settlement
   watcher that pushes real-time alerts.
 - **WhatsApp**: routed through ZeroClaw's webhook server (requires Meta Cloud

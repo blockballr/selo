@@ -141,6 +141,59 @@ def alert_all(text: str):
         send_telegram(cid, text)
 
 
+def send_telegram_buttons(
+    chat_id: int, text: str, buttons: list[list[tuple[str, str]]], parse_mode: str = "Markdown"
+):
+    """Send a message with an inline keyboard.
+
+    buttons is a list of rows; each row is a list of (label, callback_data)
+    pairs. Callback data should be ASCII (no Markdown parsing issues) and
+    short.
+    """
+    if not TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": label, "callback_data": cb} for label, cb in row] for row in buttons
+        ]
+    }
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "reply_markup": keyboard,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:
+        logging.error("sendMessage(buttons) failed: %s", e)
+
+
+def answer_callback(callback_id: str, text: str = ""):
+    """Acknowledge a callback query so Telegram clears the spinner."""
+    if not TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:
+        logging.error("answerCallbackQuery failed: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # selo-tool runner
 # ---------------------------------------------------------------------------
@@ -273,6 +326,9 @@ READONLY_COMMANDS = {
 
 HELP_TEXT = """*Selo Cryptographic Accounting Engine*
 
+Send /start for the button menu - the easiest way to work with Selo. The
+commands below do the same thing if you prefer typing.
+
 *Quotes and settlement*
 /issue `--amount <lamports> --recipient <pubkey> [--label "..."] [--message "..."]`
 /check — Inspect store status and pending quotes
@@ -318,8 +374,11 @@ def dispatch(chat_id: int, text: str) -> Optional[str]:
     # Parse quoted arguments so labels with spaces survive.
     args = _parse_args(args_str)
 
-    # ---- Help ----
-    if cmd in ("start", "help"):
+    # ---- Help / menu ----
+    if cmd == "start":
+        _main_menu(chat_id)
+        return "Use the buttons below, or send /help for the full command list."
+    if cmd == "help":
         return HELP_TEXT
 
     # ---- Status ----
@@ -472,9 +531,263 @@ def _friendly_error(out: str) -> str:
     return "That could not be completed. Please try again."
 
 
-# ---- Background jobs (ingest runs without blocking other commands) ----
+# ---------------------------------------------------------------------------
+# Button menu + click-through wizard
+# ---------------------------------------------------------------------------
+# The operator-facing GUI: a main menu of inline buttons that launch guided
+# flows. A flow asks one question at a time; the answer is captured from the
+# next plain text message, so the operator never has to type a full command.
+# Long-running actions (ingest, close) still confirm before they run.
 
-_jobs: dict[str, dict] = {}
+_wizard: dict[int, dict] = {}
+"""chat_id -> {flow, step, collected} for the active click-through wizard."""
+
+
+def _main_menu(chat_id: int) -> str:
+    """Build the main button menu for a chat."""
+    send_telegram_buttons(
+        chat_id,
+        "*Selo - pick an action*",
+        [
+            [("Issue payment", "menu:issue")],
+            [("Check pending quotes", "menu:check"), ("Confirm settlement", "menu:confirm")],
+            [("Ingest a wallet", "menu:ingest"), ("Wallet balance", "menu:balance")],
+            [("Daily close", "menu:close"), ("Export report", "menu:export")],
+            [("Status", "menu:status"), ("Help", "menu:help")],
+        ],
+    )
+    return ""
+
+
+def _begin_wizard(chat_id: int, flow: str, step: str, prompt: str):
+    _wizard[chat_id] = {"flow": flow, "step": step, "collected": {}}
+    send_telegram(chat_id, prompt)
+
+
+def _route_wizard_text(chat_id: int, text: str) -> Optional[str]:
+    """Consume a plain text message as the answer to the active wizard step.
+
+    Returns None if there is no active wizard (caller falls through to normal
+    dispatch). Returns a string reply once a flow finishes, or "" when the
+    flow is still collecting answers.
+    """
+    state = _wizard.get(chat_id)
+    if not state:
+        return None
+    flow = state["flow"]
+    collected = state["collected"]
+
+    if flow == "issue":
+        return _wizard_issue(chat_id, state, text)
+    if flow == "ingest":
+        return _wizard_ingest(chat_id, state, text)
+    if flow == "balance":
+        return _wizard_balance(chat_id, state, text)
+    if flow == "close":
+        return _wizard_close(chat_id, state, text)
+    if flow == "export":
+        return _wizard_export(chat_id, state, text)
+    return None
+
+
+def _wizard_issue(chat_id: int, state: dict, text: str) -> str:
+    collected = state["collected"]
+    step = state["step"]
+    if step == "recipient":
+        collected["recipient"] = text.strip()
+        state["step"] = "amount"
+        _wizard[chat_id] = state
+        send_telegram(
+            chat_id,
+            "How much? Type an amount in SOL (for example `1.5`).\n"
+            "Or send /cancel to back out.",
+        )
+        return ""
+    if step == "amount":
+        amt = text.strip()
+        try:
+            float(amt)
+        except ValueError:
+            send_telegram(chat_id, "That does not look like a number. Type the amount in SOL, for example `1.5`.")
+            return ""
+        collected["amount"] = amt
+        state["step"] = "label"
+        _wizard[chat_id] = state
+        send_telegram(
+            chat_id,
+            "Add a short label so you can recognize this payment later "
+            "(for example \"Website design\"). Type it, or send `skip` to leave it blank.",
+        )
+        return ""
+    if step == "label":
+        if text.strip().lower() not in ("skip", "-", "none"):
+            collected["label"] = text.strip()
+        state["step"] = "confirm"
+        _wizard[chat_id] = state
+        args = [
+            "issue",
+            "--recipient", collected.get("recipient", ""),
+            "--sol", collected.get("amount", "0"),
+        ]
+        if collected.get("label"):
+            args += ["--label", collected["label"]]
+        token = _make_confirm_token(chat_id, args)
+        send_telegram(
+            chat_id,
+            f"*Confirm payment quote*\n\n"
+            f"Pay {collected['amount']} SOL to\n`{collected['recipient']}`\n"
+            f"Label: {collected.get('label', '(none)')}\n\n"
+            f"Reply /yes `{token}` to issue it, or /cancel to abort.",
+        )
+        _wizard.pop(chat_id, None)
+        return ""
+    return ""
+
+
+def _wizard_ingest(chat_id: int, state: dict, text: str) -> str:
+    collected = state["collected"]
+    step = state["step"]
+    if step == "address":
+        collected["address"] = text.strip()
+        state["step"] = "range"
+        _wizard[chat_id] = state
+        send_telegram_buttons(
+            chat_id,
+            "How much history should I fetch?",
+            [
+                [("Full history", "ingest:full")],
+                [("Only this year", "ingest:year")],
+                [("Cancel", "ingest:cancel")],
+            ],
+        )
+        return ""
+    return ""
+
+
+def _wizard_balance(chat_id: int, state: dict, text: str) -> str:
+    collected = state["collected"]
+    step = state["step"]
+    if step == "address":
+        collected["address"] = text.strip()
+        _wizard.pop(chat_id, None)
+        return run_selo_pretty(["balance", collected["address"]])
+    return ""
+
+
+def _wizard_close(chat_id: int, state: dict, text: str) -> str:
+    collected = state["collected"]
+    step = state["step"]
+    if step == "date":
+        collected["date"] = text.strip()
+        state["step"] = "confirm"
+        _wizard[chat_id] = state
+        now = int(time.time())
+        day_start = now - (now % 86400)
+        day_end = day_start + 86400
+        args = ["close", "--start", str(day_start), "--end", str(day_end)]
+        token = _make_confirm_token(chat_id, args)
+        send_telegram(
+            chat_id,
+            f"*Confirm daily close*\n\n"
+            f"Close today's ledger ({collected['date']}) and compute the "
+            f"Poseidon commitment.\n\n"
+            f"Reply /yes `{token}` to run it, or /cancel to abort.",
+        )
+        _wizard.pop(chat_id, None)
+        return ""
+    return ""
+
+
+def _wizard_export(chat_id: int, state: dict, text: str) -> str:
+    collected = state["collected"]
+    step = state["step"]
+    if step == "wallet":
+        collected["wallet"] = text.strip()
+        _wizard.pop(chat_id, None)
+        return run_selo_pretty(["export-html", "--wallet", collected["wallet"]])
+    return ""
+
+
+def handle_callback(chat_id: int, callback_data: str, callback_id: str) -> Optional[str]:
+    """Route an inline-button tap to the matching action."""
+    answer_callback(callback_id)
+    if callback_data == "menu:help":
+        return HELP_TEXT
+    if callback_data == "menu:status":
+        return dispatch(chat_id, "/status")
+    if callback_data == "menu:check":
+        return run_selo_pretty(["check"])
+    if callback_data == "menu:confirm":
+        return run_selo_pretty(["confirm"])
+    if callback_data == "menu:issue":
+        if not is_admin(chat_id):
+            return "This requires admin authorization."
+        _begin_wizard(
+            chat_id, "issue", "recipient",
+            "Issue a payment quote.\n\nFirst: whose wallet should receive it? "
+            "Paste the Solana address (or a registered counterparty name).\n"
+            "Send /cancel to back out.",
+        )
+        return ""
+    if callback_data == "menu:ingest":
+        if not is_admin(chat_id):
+            return "This requires admin authorization."
+        _begin_wizard(
+            chat_id, "ingest", "address",
+            "Ingest a wallet's transaction history.\n\nPaste the Solana address "
+            "to scan (or a registered counterparty name).\nSend /cancel to back out.",
+        )
+        return ""
+    if callback_data == "menu:balance":
+        _begin_wizard(
+            chat_id, "balance", "address",
+            "Wallet balance.\n\nPaste the Solana address to look up.\n"
+            "Send /cancel to back out.",
+        )
+        return ""
+    if callback_data == "menu:close":
+        if not is_admin(chat_id):
+            return "This requires admin authorization."
+        _begin_wizard(
+            chat_id, "close", "date",
+            "Daily close.\n\nType today's date (for example `2026-08-15`) to "
+            "confirm which day to close.\nSend /cancel to back out.",
+        )
+        return ""
+    if callback_data == "menu:export":
+        _begin_wizard(
+            chat_id, "export", "wallet",
+            "Export an audit report.\n\nWhich wallet should the report cover? "
+            "Paste the address or name.\nSend /cancel to back out.",
+        )
+        return ""
+    if callback_data == "ingest:full":
+        addr = _wizard.get(chat_id, {}).get("collected", {}).get("address", "")
+        _wizard.pop(chat_id, None)
+        if not addr:
+            return "Ingestion cancelled."
+        return _start_ingest(chat_id, [addr, "--all"])
+    if callback_data == "ingest:year":
+        addr = _wizard.get(chat_id, {}).get("collected", {}).get("address", "")
+        _wizard.pop(chat_id, None)
+        if not addr:
+            return "Ingestion cancelled."
+        return _start_ingest(chat_id, [addr])
+    if callback_data == "ingest:cancel":
+        _wizard.pop(chat_id, None)
+        return "Ingestion cancelled."
+    return "That option is not available."
+
+
+def _cancel_wizard(chat_id: int) -> bool:
+    """Clear any active wizard. Returns True if one was cancelled."""
+    if chat_id in _wizard:
+        _wizard.pop(chat_id, None)
+        return True
+    return False
+
+
+# ---- Background jobs (ingest runs without blocking other commands) ----_jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 
 
@@ -791,6 +1104,24 @@ def poll_telegram(stop_event: threading.Event):
                 consecutive_errors = 0
                 for result in data.get("result", []):
                     offset = result["update_id"] + 1
+
+                    # Inline-button tap: route to the callback handler.
+                    cb = result.get("callback_query")
+                    if cb:
+                        chat_id = cb.get("message", {}).get("chat", {}).get("id")
+                        cb_data = cb.get("data", "")
+                        cb_id = cb.get("id", "")
+                        if not chat_id or not cb_data:
+                            continue
+                        logging.info("[chat %s] callback: %s", chat_id, cb_data)
+                        with _run_lock:
+                            pass
+                        reply = handle_callback(chat_id, cb_data, cb_id)
+                        if reply:
+                            send_telegram(chat_id, reply)
+                        continue
+
+                    # Plain text message.
                     msg = result.get("message", {})
                     chat_id = msg.get("chat", {}).get("id")
                     text = msg.get("text", "").strip()
@@ -798,11 +1129,28 @@ def poll_telegram(stop_event: threading.Event):
                         continue
 
                     logging.info("[chat %s] %s", chat_id, text[:100])
+                    # /cancel clears any active wizard.
+                    if text.lower().lstrip("/") == "cancel":
+                        if _cancel_wizard(chat_id):
+                            reply = "Cancelled."
+                        else:
+                            reply = "Nothing to cancel."
+                        send_telegram(chat_id, reply)
+                        continue
+
+                    # If a wizard is waiting, feed this text to it.
+                    wizard_reply = _route_wizard_text(chat_id, text)
+                    if wizard_reply is not None:
+                        if wizard_reply:
+                            with _run_lock:
+                                pass
+                            send_telegram(chat_id, wizard_reply)
+                        continue
+
+                    with _run_lock:
+                        pass
                     reply = dispatch(chat_id, text)
                     if reply:
-                        # Acquire lock briefly to avoid overlapping with watcher.
-                        with _run_lock:
-                            pass
                         send_telegram(chat_id, reply)
         except Exception as e:
             consecutive_errors += 1
