@@ -553,6 +553,7 @@ def _main_menu(chat_id: int) -> str:
             [("Check pending quotes", "menu:check"), ("Confirm settlement", "menu:confirm")],
             [("Ingest a wallet", "menu:ingest"), ("Wallet balance", "menu:balance")],
             [("Daily close", "menu:close"), ("Export report", "menu:export")],
+            [("Register a counterparty", "menu:rules"), ("PTAX rate", "menu:ptax")],
             [("Status", "menu:status"), ("Help", "menu:help")],
         ],
     )
@@ -587,6 +588,8 @@ def _route_wizard_text(chat_id: int, text: str) -> Optional[str]:
         return _wizard_close(chat_id, state, text)
     if flow == "export":
         return _wizard_export(chat_id, state, text)
+    if flow == "rules":
+        return _wizard_rules(chat_id, state, text)
     return None
 
 
@@ -708,6 +711,26 @@ def _wizard_export(chat_id: int, state: dict, text: str) -> str:
     return ""
 
 
+def _wizard_rules(chat_id: int, state: dict, text: str) -> str:
+    collected = state["collected"]
+    step = state["step"]
+    if step == "address":
+        collected["address"] = text.strip()
+        state["step"] = "name"
+        _wizard[chat_id] = state
+        send_telegram(
+            chat_id,
+            "What should this address be called? Type a label, for example "
+            "`Marketplace` or `Design client`. Send /cancel to back out.",
+        )
+        return ""
+    if step == "name":
+        collected["name"] = text.strip()
+        _wizard.pop(chat_id, None)
+        return run_selo_pretty(["rules", "--add", collected["address"], "--name", collected["name"]])
+    return ""
+
+
 def handle_callback(chat_id: int, callback_data: str, callback_id: str) -> Optional[str]:
     """Route an inline-button tap to the matching action."""
     answer_callback(callback_id)
@@ -776,6 +799,18 @@ def handle_callback(chat_id: int, callback_data: str, callback_id: str) -> Optio
     if callback_data == "ingest:cancel":
         _wizard.pop(chat_id, None)
         return "Ingestion cancelled."
+    if callback_data == "menu:ptax":
+        return run_selo_pretty(["ptax"])
+    if callback_data == "menu:rules":
+        if not is_admin(chat_id):
+            return "This requires admin authorization."
+        _begin_wizard(
+            chat_id, "rules", "address",
+            "Register a counterparty.\n\nPaste the Solana address you want to "
+            "label (the review command lists addresses that need a label).\n"
+            "Send /cancel to back out.",
+        )
+        return ""
     return "That option is not available."
 
 
