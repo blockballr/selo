@@ -192,9 +192,75 @@ def send_telegram_buttons(
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
+            body = json.loads(resp.read().decode("utf-8"))
+        mid = body.get("result", {}).get("message_id")
+        if mid:
+            _menu_msgs[chat_id] = mid
     except Exception as e:
         logging.error("sendMessage(buttons) failed: %s", e)
+
+
+def _edit_buttons(chat_id: int, message_id: int, text: str, buttons: list[list[tuple[str, str]]]):
+    """Edit an existing inline-keyboard message in place."""
+    if not TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": label, "callback_data": cb} for label, cb in row] for row in buttons
+        ]
+    }
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "reply_markup": keyboard,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:
+        logging.error("editMessageText failed: %s", e)
+
+
+def _clear_buttons(chat_id: int, message_id: int):
+    """Remove the inline keyboard from a message without changing its text."""
+    if not TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/editMessageReplyMarkup"
+    payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": {}}
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:
+        logging.error("editMessageReplyMarkup failed: %s", e)
+
+
+def _send_or_edit_menu(chat_id: int, text: str, buttons: list[list[tuple[str, str]]]):
+    """Show a menu, editing the previous one in place when present.
+
+    Navigation menus (list -> manage -> back to list) rewrite the same message
+    instead of stacking new ones, so the chat does not fill with stale menus.
+    """
+    prev = _menu_msgs.get(chat_id)
+    if prev is not None:
+        _edit_buttons(chat_id, prev, text, buttons)
+    else:
+        send_telegram_buttons(chat_id, text, buttons)
+
+
+# chat_id -> message_id of the most recent button menu, so a choice can
+# clear its own keyboard and not leave stale clickable buttons behind.
+_menu_msgs: dict[int, int] = {}
 
 
 def answer_callback(callback_id: str, text: str = ""):
@@ -597,6 +663,7 @@ def _main_menu(chat_id: int) -> str:
             [("Issue payment", "menu:issue")],
             [("Check pending quotes", "menu:check"), ("Confirm settlement", "menu:confirm")],
             [("Ingest a wallet", "menu:ingest"), ("Wallet balance", "menu:balance")],
+            [("Manage wallets", "menu:wallets")],
             [("Daily close", "menu:close"), ("Export report", "menu:export")],
             [("Register a counterparty", "menu:rules"), ("PTAX rate", "menu:ptax")],
             [("Status", "menu:status"), ("Help", "menu:help")],
@@ -635,6 +702,8 @@ def _route_wizard_text(chat_id: int, text: str) -> Optional[str]:
         return _wizard_export(chat_id, state, text)
     if flow == "rules":
         return _wizard_rules(chat_id, state, text)
+    if flow == "wallets":
+        return _wizard_wallets(chat_id, state, text)
     return None
 
 
@@ -749,10 +818,24 @@ def _wizard_close(chat_id: int, state: dict, text: str) -> str:
 def _wizard_export(chat_id: int, state: dict, text: str) -> str:
     collected = state["collected"]
     step = state["step"]
-    if step == "wallet":
-        collected["wallet"] = text.strip()
+    if step == "from":
+        collected["from"] = text.strip()
+        state["step"] = "to"
+        _wizard[chat_id] = state
+        send_telegram(
+            chat_id,
+            "Now type the end date as `YYYY-MM-DD`.\nSend /cancel to back out.",
+        )
+        return ""
+    if step == "to":
+        collected["to"] = text.strip()
         _wizard.pop(chat_id, None)
-        return run_selo_pretty(["export-html", "--wallet", collected["wallet"]])
+        wallet = collected.get("wallet", "")
+        if not wallet:
+            return "No wallet selected. Start the export again."
+        return run_selo_pretty(
+            ["export-html", "--wallet", wallet, "--from", collected["from"], "--to", collected["to"]]
+        )
     return ""
 
 
@@ -773,6 +856,175 @@ def _wizard_rules(chat_id: int, state: dict, text: str) -> str:
         collected["name"] = text.strip()
         _wizard.pop(chat_id, None)
         return run_selo_pretty(["rules", "--add", collected["address"], "--name", collected["name"]])
+    return ""
+
+
+def _wizard_wallets(chat_id: int, state: dict, text: str) -> str:
+    collected = state["collected"]
+    step = state["step"]
+    if step == "address":
+        addr = text.strip()
+        _wizard.pop(chat_id, None)
+        return _wallet_manage_menu(chat_id, addr)
+    if step == "newname":
+        collected["newname"] = text.strip()
+        _wizard.pop(chat_id, None)
+        addr = collected.get("address", "")
+        rc, out = run_selo(["rules", "--add", addr, "--name", collected["newname"]], timeout=15)
+        if rc != 0:
+            return _friendly_error(out)
+        return f"Wallet `{addr}` is now labelled `{collected['newname']}`."
+    return ""
+
+
+def _wallet_buttons(chat_id: int) -> Optional[str]:
+    """List every known wallet as a button, then route the tap to management.
+
+    Known means either a ledger file on disk or a merchant-tracked wallet.
+    Ledger files are discovered by name (`.selo_ledger_<pubkey>.json`), so a
+    reset wallet whose content was cleared still shows up. Returns None when
+    the list is empty (caller shows the fallback prompt).
+    """
+    base58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+    def is_pubkey(s):
+        return (
+            len(s) in (32, 43, 44)
+            and all(c in base58 for c in s)
+        )
+
+    known: dict[str, str] = {}
+    if DATA_DIR.is_dir():
+        for path in DATA_DIR.glob(".selo_ledger_*.json"):
+            pub = path.name[len(".selo_ledger_"):-len(".json")]
+            known[pub] = pub
+    rc, out = run_selo(["wallets"], timeout=20)
+    if rc == 0:
+        for line in out.splitlines():
+            m = re.match(r"^\s*(\S{32,44})(?:\s+\(([^)]*)\))?", line)
+            if m and is_pubkey(m.group(1)):
+                pub = m.group(1)
+                label = m.group(2) or pub
+                if label != "Unknown Counterparty":
+                    known[pub] = label
+    rc2, out2 = run_selo(["merchant"], timeout=15)
+    if rc2 == 0:
+        for line in out2.splitlines():
+            m = re.match(r"^\s*(?:primary|tracked)\s+(\S{32,44})\s+\(([^)]*)\)", line)
+            if m and is_pubkey(m.group(1)) and m.group(1) not in known:
+                known[m.group(1)] = m.group(2)
+    if not known:
+        return None
+    rows = []
+    for pub, label in sorted(known.items()):
+        if label != pub and label != "Unknown Counterparty" and len(label) <= 28:
+            text = f"{label} ({pub[:6]}...{pub[-4:]})"
+        else:
+            text = pub
+        rows.append([(text, f"wallet:sel:{pub}")])
+    rows.append([("Add a new wallet", "wallet:add")])
+    rows.append([("Cancel", "ingest:cancel")])
+    _send_or_edit_menu(
+        chat_id,
+        "Wallets I know about. Tap one to manage it, or add a new one.",
+        rows,
+    )
+    return ""
+
+
+def _wallet_manage_menu(chat_id: int, pubkey: str) -> str:
+    """Show management actions for one wallet."""
+    _wizard[chat_id] = {"flow": "wallets", "step": "manage", "collected": {"address": pubkey}}
+    ledger = DATA_DIR / f".selo_ledger_{pubkey}.json"
+    ingested = "yes" if ledger.exists() else "no"
+    _send_or_edit_menu(
+        chat_id,
+        f"`{pubkey}`\nIngested: {ingested}",
+        [
+            [("Rename / label", "wallet:rename")],
+            [("Reset ledger (re-ingest fresh)", "wallet:reset")],
+            [("Remove from tracking", "wallet:untrack")],
+            [("Delete wallet (ledger + untrack)", "wallet:delete")],
+            [("Back to list", "wallet:list")],
+        ],
+    )
+    return ""
+
+
+def _ingested_wallets() -> dict[str, str]:
+    """Wallet pubkey -> label for ledgers that actually have content.
+
+    A ledger that was reset writes `{"wallets": {}}`, which is a file but not
+    an ingested wallet. A ledger with a wallet entry is ingested. Labels come
+    from the counterparty rules; a missing label shows the short pubkey.
+    """
+    ingested: dict[str, str] = {}
+    if not DATA_DIR.is_dir():
+        return ingested
+    for path in DATA_DIR.glob(".selo_ledger_*.json"):
+        pub = path.name[len(".selo_ledger_"):-len(".json")]
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        wallets = data.get("wallets") if isinstance(data, dict) else None
+        if not wallets:
+            continue
+        if pub not in wallets:
+            continue
+        label = pub
+        rc, out = run_selo(["rules"], timeout=15)
+        if rc == 0:
+            m = re.search(rf"^{re.escape(pub)} -> (.+)$", out, re.MULTILINE)
+            if m:
+                label = m.group(1)
+        ingested[pub] = label
+    return ingested
+
+
+def _export_wallet_buttons(chat_id: int) -> Optional[str]:
+    """List ingested wallets as buttons, each labelled with its country.
+
+    Country is the reporting currency the wallet was ingested for. Phase 5
+    (country support) is not shipped, so every wallet today reads as BRL, the
+    single supported regime. When country support lands, this reads the
+    persisted per-wallet country instead of the constant.
+    """
+    ingested = _ingested_wallets()
+    if not ingested:
+        return None
+    rows = []
+    for pub, label in sorted(ingested.items()):
+        text = f"{label[:22]} ({pub[:6]}...{pub[-4:]}) - BRL"
+        rows.append([(text, f"export:sel:{pub}")])
+    rows.append([("Wallet not ingested? Ingest it", "export:need-ingest")])
+    rows.append([("Cancel", "ingest:cancel")])
+    _send_or_edit_menu(
+        chat_id,
+        "Export an audit report.\n\nPick the wallet (with its reporting "
+        "country). Only ingested wallets are listed.",
+        rows,
+    )
+    return ""
+
+
+def _export_range_buttons(chat_id: int, pubkey: str) -> str:
+    """Date-range options for one wallet's report."""
+    _wizard[chat_id] = {
+        "flow": "export",
+        "step": "range",
+        "collected": {"wallet": pubkey},
+    }
+    _send_or_edit_menu(
+        chat_id,
+        "Which period should the report cover?",
+        [
+            [("Full history", "export:full")],
+            [("This year", "export:year")],
+            [("Custom range (from/to)", "export:custom")],
+            [("Back to wallets", "export:list")],
+        ],
+    )
     return ""
 
 
@@ -823,10 +1075,51 @@ def handle_callback(chat_id: int, callback_data: str, callback_id: str) -> Optio
         )
         return ""
     if callback_data == "menu:export":
+        reply = _export_wallet_buttons(chat_id)
+        if reply is None:
+            return (
+                "No ingested wallets to export. Ingest a wallet first, then "
+                "come back here."
+            )
+        return reply
+    if callback_data == "export:need-ingest":
         _begin_wizard(
-            chat_id, "export", "wallet",
-            "Export an audit report.\n\nWhich wallet should the report cover? "
-            "Paste the address or name.\nSend /cancel to back out.",
+            chat_id, "ingest", "address",
+            "Ingest a wallet's transaction history first.\n\nPaste the Solana "
+            "address to scan.\nSend /cancel to back out.",
+        )
+        return ""
+    if callback_data == "export:list":
+        return _export_wallet_buttons(chat_id)
+    if callback_data.startswith("export:sel:"):
+        pubkey = callback_data[len("export:sel:"):]
+        return _export_range_buttons(chat_id, pubkey)
+    if callback_data == "export:full":
+        addr = _wizard.get(chat_id, {}).get("collected", {}).get("wallet", "")
+        _wizard.pop(chat_id, None)
+        if not addr:
+            return "No wallet selected. Start the export again."
+        return run_selo_pretty(["export-html", "--wallet", addr])
+    if callback_data == "export:year":
+        addr = _wizard.get(chat_id, {}).get("collected", {}).get("wallet", "")
+        _wizard.pop(chat_id, None)
+        if not addr:
+            return "No wallet selected. Start the export again."
+        year = FISCAL_YEAR
+        return run_selo_pretty(["export-html", "--wallet", addr, "--year", year])
+    if callback_data == "export:custom":
+        addr = _wizard.get(chat_id, {}).get("collected", {}).get("wallet", "")
+        if not addr:
+            return "No wallet selected. Start the export again."
+        _wizard[chat_id] = {
+            "flow": "export",
+            "step": "from",
+            "collected": {"wallet": addr},
+        }
+        send_telegram(
+            chat_id,
+            "Custom range.\n\nType the start date as `YYYY-MM-DD`, then the "
+            "end date in the next message.\nSend /cancel to back out.",
         )
         return ""
     if callback_data == "ingest:full":
@@ -852,6 +1145,81 @@ def handle_callback(chat_id: int, callback_data: str, callback_id: str) -> Optio
     if callback_data == "ingest:cancel":
         _wizard.pop(chat_id, None)
         return "Ingestion cancelled."
+    if callback_data == "menu:wallets":
+        if not is_admin(chat_id):
+            return "This requires admin authorization."
+        reply = _wallet_buttons(chat_id)
+        if reply is None:
+            return (
+                "No wallets are known yet. Ingest one first, or send me an "
+                "address to track."
+            )
+        return reply
+    if callback_data == "wallet:add":
+        _begin_wizard(
+            chat_id, "wallets", "address",
+            "Add a new wallet.\n\nPaste the Solana address to track.\n"
+            "Send /cancel to back out.",
+        )
+        return ""
+    if callback_data == "wallet:list":
+        return _wallet_buttons(chat_id)
+    if callback_data.startswith("wallet:sel:"):
+        pubkey = callback_data[len("wallet:sel:"):]
+        return _wallet_manage_menu(chat_id, pubkey)
+    if callback_data == "wallet:rename":
+        addr = _wizard.get(chat_id, {}).get("collected", {}).get("address", "")
+        if not addr:
+            return "No wallet selected. Start again with the Manage wallets button."
+        _wizard[chat_id] = {
+            "flow": "wallets",
+            "step": "newname",
+            "collected": {"address": addr},
+        }
+        send_telegram(
+            chat_id,
+            "What should this wallet be called? Type the new label.\n"
+            "Send /cancel to back out.",
+        )
+        return ""
+    if callback_data == "wallet:reset":
+        addr = _wizard.get(chat_id, {}).get("collected", {}).get("address", "")
+        _wizard.pop(chat_id, None)
+        if not addr:
+            return "No wallet selected. Start again with the Manage wallets button."
+        ledger = DATA_DIR / f".selo_ledger_{addr}.json"
+        if not ledger.exists():
+            return "No saved ledger was found for that wallet. Nothing to reset."
+        try:
+            with open(ledger, "w", encoding="ascii") as f:
+                f.write('{"wallets": {}}')
+        except OSError as e:
+            return f"Could not clear the ledger: {e}"
+        ack = _start_ingest(chat_id, [addr, "--all"])
+        return (
+            f"Ledger for `{addr}` was cleared. {ack}"
+        )
+    if callback_data == "wallet:untrack":
+        addr = _wizard.get(chat_id, {}).get("collected", {}).get("address", "")
+        _wizard.pop(chat_id, None)
+        if not addr:
+            return "No wallet selected. Start again with the Manage wallets button."
+        rc, out = run_selo(["merchant", "--remove", addr], timeout=15)
+        if rc != 0:
+            return _friendly_error(out)
+        return f"Wallet `{addr}` was removed from tracking."
+    if callback_data == "wallet:delete":
+        addr = _wizard.get(chat_id, {}).get("collected", {}).get("address", "")
+        _wizard.pop(chat_id, None)
+        if not addr:
+            return "No wallet selected. Start again with the Manage wallets button."
+        ledger = DATA_DIR / f".selo_ledger_{addr}.json"
+        if ledger.exists():
+            ledger.unlink()
+        rc, out = run_selo(["merchant", "--remove", addr], timeout=15)
+        if rc != 0 and "was not tracked" not in out:
+            return _friendly_error(out)
+        return f"Wallet `{addr}` was deleted (ledger removed and untracked)."
     if callback_data == "menu:ptax":
         return run_selo_pretty(["ptax"])
     if callback_data == "menu:rules":
@@ -1221,12 +1589,29 @@ def poll_telegram(stop_event: threading.Event):
                         chat_id = cb.get("message", {}).get("chat", {}).get("id")
                         cb_data = cb.get("data", "")
                         cb_id = cb.get("id", "")
+                        cb_msg_id = cb.get("message", {}).get("message_id")
                         if not chat_id or not cb_data:
                             continue
                         logging.info("[chat %s] callback: %s", chat_id, cb_data)
-                        with _run_lock:
-                            pass
                         reply = handle_callback(chat_id, cb_data, cb_id)
+                        # After a terminal choice, clear this menu's buttons so
+                        # the tap target self-destructs instead of lingering.
+                        if cb_msg_id and cb_data not in (
+                            "menu:help",
+                            "menu:status",
+                            "menu:check",
+                            "menu:confirm",
+                            "menu:issue",
+                            "menu:ingest",
+                            "menu:balance",
+                            "menu:close",
+                            "menu:export",
+                            "menu:rules",
+                            "menu:wallets",
+                            "wallet:list",
+                            "export:list",
+                        ):
+                            _clear_buttons(chat_id, cb_msg_id)
                         if reply:
                             send_telegram(chat_id, reply)
                         continue
@@ -1278,6 +1663,40 @@ def poll_telegram(stop_event: threading.Event):
 # ---------------------------------------------------------------------------
 
 
+def register_bot_commands():
+    """Register the selo slash commands with Telegram, replacing the stale
+    ZeroClaw tool menu that was left when the daemon owned the token."""
+    if not TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/setMyCommands"
+    commands = [
+        {"command": "start", "description": "Show the button menu"},
+        {"command": "help", "description": "Full command list"},
+        {"command": "status", "description": "Store and watcher health"},
+        {"command": "check", "description": "Inspect store status and pending quotes"},
+        {"command": "confirm", "description": "Reconcile pending quotes on chain"},
+        {"command": "balance", "description": "Query a wallet balance"},
+        {"command": "ptax", "description": "Show the current PTAX rate"},
+        {"command": "ingest", "description": "Ingest a wallet's history"},
+        {"command": "review", "description": "List unclassified counterparties"},
+        {"command": "export", "description": "Export an audit report"},
+        {"command": "close", "description": "Run a daily close"},
+    ]
+    payload = json.dumps({"commands": commands}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        logging.info("Registered selo bot commands.")
+    except Exception as e:
+        logging.error("setMyCommands failed: %s", e)
+
+
 def main():
     logging.info("=== Selo Telegram Operational Harness ===")
     logging.info("SELO_PATH: %s", SELO_PATH)
@@ -1286,6 +1705,8 @@ def main():
     logging.info("ALERT_IDS: %s", ALERT_IDS or "(none)")
     logging.info("MERCHANT: %s", MERCHANT_PUBKEY or "(not set)")
     logging.info("APScheduler: %s", "available" if HAS_APSCHEDULER else "not installed — cron disabled")
+
+    register_bot_commands()
 
     stop = threading.Event()
     threads = [
