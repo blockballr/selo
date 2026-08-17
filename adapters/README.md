@@ -27,7 +27,13 @@ The Telegram adapter is the main control surface for Selo. It provides:
 - **Progress streaming**: Long-running ingest commands stream progress updates
   back to the chat so the operator can watch the backfill proceed, and they
   run on a background thread so the operator can keep using other commands
-  while an ingestion is in progress.
+  while an ingestion is in progress. A wallet that was already ingested
+  resumes with no new activity and the bot says so instead of reporting a
+  misleading empty result.
+- **LLM forwarding**: Free-form text that is not a selo command is forwarded
+  to the ZeroClaw gateway webhook (`POST /webhook?agent=selo`), and the
+  agent's reply is sent back to the chat. The button GUI works without the
+  LLM; the forward is an addition, not a dependency.
 - **Plain-language errors**: Rust stack traces and raw RPC JSON never reach
   the chat. Failures are translated into short, actionable sentences.
 
@@ -53,6 +59,7 @@ Environment variables:
 | `SELO_DATA_DIR` | No | Directory where selo-tool state files live (default: the repo root, so the adapter, CLI, and agent share one set of `.selo_*` files) |
 | `SELO_FISCAL_YEAR` | No | Fiscal year for report generation (default: `2026`) |
 | `SELO_RECONCILIATION_SECS` | No | Settlement check interval (default: `60`) |
+| `ZEROCLAW_GATEWAY_URL` | No | ZeroClaw gateway base URL for free-form LLM forwarding (default: `http://127.0.0.1:42617`) |
 | `HELIUS_API_KEY` | No | Helius RPC API key for dedicated Solana access |
 | `SOLANA_RPC_URL` | No | Override the default mainnet RPC endpoint |
 

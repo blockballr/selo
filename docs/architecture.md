@@ -38,7 +38,7 @@ pub trait RpcSeam {
 
 `AccountingEngine<T: RpcSeam>` wraps an RPC transport and exposes the full
 engine API. Tests inject a stub `RpcSeam` that returns canned responses, so
-all 287 tests run offline with no network dependency.
+all 296 selo-core tests run offline with no network dependency.
 
 **Model-Excluded Money Path**
 
@@ -417,9 +417,15 @@ Channel adapters live in `adapters/`:
   operational interface, with a button menu and click-through wizard for
   non-technical operators, built-in cron scheduling for the daily close and
   periodic reconciliation, SOP-driven guided workflows, and a settlement
-  watcher that pushes real-time alerts.
+  watcher that pushes real-time alerts. The adapter owns the Telegram bot
+  token and renders the button GUI itself, so the interface works without any
+  LLM. Free-form text that is not a selo command is forwarded to the ZeroClaw
+  gateway webhook (`POST /webhook?agent=selo`) and the agent's reply is sent
+  back to the chat. The ZeroClaw daemon's own Telegram channel is disabled so
+  both sides do not compete for the same token.
 - **WhatsApp**: routed through ZeroClaw's webhook server (requires Meta Cloud
   API and a public webhook URL).
 
-The adapter owns scheduling; ZeroClaw provides the WhatsApp webhook surface
-only. See `adapters/README.md` for the full setup and runbook.
+The adapter owns scheduling and the Telegram token; ZeroClaw provides the
+LLM forwarding surface via its gateway webhook and the WhatsApp webhook
+surface. See `adapters/README.md` for the full setup and runbook.

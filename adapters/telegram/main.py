@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +73,12 @@ RECONCILIATION_INTERVAL = int(
 )
 MERCHANT_PUBKEY = os.environ.get("SELO_MERCHANT", "")
 FISCAL_YEAR = os.environ.get("SELO_FISCAL_YEAR", "2026")
+# ZeroClaw gateway webhook for free-form LLM prompts. The adapter owns the
+# Telegram token and renders the button GUI itself; text that is not a selo
+# command is forwarded here and the reply is sent back to the chat.
+ZEROCLAW_GATEWAY = os.environ.get(
+    "ZEROCLAW_GATEWAY_URL", "http://127.0.0.1:42617"
+)
 
 # Ensure data directory exists.
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -125,6 +132,21 @@ def send_telegram(chat_id: int, text: str, parse_mode: str = "Markdown"):
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and parse_mode:
+                payload.pop("parse_mode", None)
+                data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        resp.read()
+                    return
+                except Exception as e2:
+                    logging.error("sendMessage retry failed: %s", e2)
+                    return
+            logging.error("sendMessage failed: %s", e)
         except Exception as e:
             logging.error("sendMessage failed: %s", e)
 
@@ -455,7 +477,30 @@ def dispatch(chat_id: int, text: str) -> Optional[str]:
             f"This token expires in 2 minutes."
         )
 
-    return f"Unknown command: `{text}`. Type /help for available commands."
+    return forward_to_llm(chat_id, text)
+
+
+def forward_to_llm(chat_id: int, text: str) -> str:
+    """POST a free-form prompt to the ZeroClaw selo agent via its webhook.
+
+    Returns the agent reply, or a plain-language note when the gateway is
+    down or the LLM request fails, so the button GUI keeps working on its own.
+    """
+    url = f"{ZEROCLAW_GATEWAY}/webhook?agent=selo"
+    payload = json.dumps({"message": text}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        return str(body.get("response", "")) or "The agent returned no reply."
+    except Exception as e:
+        logging.warning("LLM forward failed (chat %s): %s", chat_id, e)
+        return (
+            "The LLM is not reachable right now. Use the buttons or a / command "
+            "to keep working."
+        )
 
 
 # ---- Confirm-token machinery ----
@@ -786,15 +831,23 @@ def handle_callback(chat_id: int, callback_data: str, callback_id: str) -> Optio
         return ""
     if callback_data == "ingest:full":
         addr = _wizard.get(chat_id, {}).get("collected", {}).get("address", "")
-        _wizard.pop(chat_id, None)
         if not addr:
+            with _jobs_lock:
+                running = chat_id in _jobs
+            if running:
+                return "An ingestion is already running for this chat. It posts progress here; wait for the completion message."
             return "Ingestion cancelled."
+        _wizard.pop(chat_id, None)
         return _start_ingest(chat_id, [addr, "--all"])
     if callback_data == "ingest:year":
         addr = _wizard.get(chat_id, {}).get("collected", {}).get("address", "")
-        _wizard.pop(chat_id, None)
         if not addr:
+            with _jobs_lock:
+                running = chat_id in _jobs
+            if running:
+                return "An ingestion is already running for this chat. It posts progress here; wait for the completion message."
             return "Ingestion cancelled."
+        _wizard.pop(chat_id, None)
         return _start_ingest(chat_id, [addr])
     if callback_data == "ingest:cancel":
         _wizard.pop(chat_id, None)
@@ -822,7 +875,8 @@ def _cancel_wizard(chat_id: int) -> bool:
     return False
 
 
-# ---- Background jobs (ingest runs without blocking other commands) ----_jobs: dict[str, dict] = {}
+# ---- Background jobs (ingest runs without blocking other commands) ----
+_jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 
 
@@ -866,6 +920,7 @@ def _stream_ingest(chat_id: int, args: list[str]):
         return
 
     summary: list[str] = []
+    resumed = False
     last_progress_sent = 0.0
     try:
         for line in proc.stdout:
@@ -887,14 +942,34 @@ def _stream_ingest(chat_id: int, args: list[str]):
                         f"About {eta_txt} remaining.",
                     )
                 continue
-            # Keep the useful end-of-run lines for the summary.
-            if any(k in line for k in ("Summary", "Events", "classified", "review", "Tax lots")):
+            if "already processed" in line or "Resuming" in line:
+                resumed = True
+            if any(
+                k in line
+                for k in (
+                    "already processed",
+                    "dispose_fifo",
+                    "Capital Gains Summary",
+                    "Total proceeds",
+                    "Total cost basis",
+                    "Net gain/loss",
+                    "Total Events:",
+                    "Ingestion Summary",
+                )
+            ):
                 summary.append(line)
         proc.wait()
         if proc.returncode != 0:
             send_telegram(chat_id, _friendly_error("".join(summary)))
         elif summary:
-            send_telegram(chat_id, "Ingestion complete.\n" + "\n".join(summary[-20:]))
+            lines = "\n".join(summary[-20:])
+            if resumed:
+                send_telegram(
+                    chat_id,
+                    f"Ingestion complete. No new activity found.\n\n{lines}",
+                )
+            else:
+                send_telegram(chat_id, f"Ingestion complete.\n\n{lines}")
         else:
             send_telegram(chat_id, "Ingestion complete.")
     except Exception as e:

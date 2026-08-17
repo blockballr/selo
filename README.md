@@ -127,6 +127,7 @@ disposals. The choice is persisted on the ledger.
 - [x] **Phase 2: Alicerce (Stages 4-5)** -- Foundational RPC infrastructure (RpcSeam and ureq) and persistence
 - [x] **Phase 3: Virgilia (Stages 6-9)** -- Ledger Intelligence, Solana Pay URIs, PDA derivation, and counterparty auto-labeling
 - [x] **Phase 4: Selo (Stages 10-12)** -- Deterministic Daily Closes, Poseidon BN254 Commitments, Identity Shield, Self-Verifying HTML Audit Reports, Ingest Checkpointing, Per-Wallet Date-Ranged Reports
+- [ ] **Phase 5: Country Support** -- Reporting-currency selection beyond BRL (US, Canada, and others; the exact country set is not finalized). The operator picks a country once at merchant setup, stored in `.selo_merchant.json`, and the valuation layer reads it at ingest time. Changing country later requires a re-ingest so cost basis stays deterministic. USD-style currencies: stablecoins value at 1:1 and SOL uses the existing SOL/USD cascade without the BRL hop. Tax columns differ per country, so the applicable regime is researched and codified per country as it is added; Brazil keeps its flat 15% capital-gains column, and a US mode would split gains into short-term (held under 1 year) and long-term (held 1+ years) with no single flat rate.
 
 ### Developer Quickstart and CLI Command Reference
 
@@ -136,8 +137,8 @@ disposals. The choice is persisted on the ledger.
 cargo test --workspace
 ```
 
-287 tests, all in selo-core. No test requires a network connection or a
-running node.
+296 tests, all in selo-core, plus 5 in selo-tool. No test requires a
+network connection or a running node.
 
 #### 2. Query Account Balance and Counterparty Resolution
 
