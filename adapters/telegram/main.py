@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -58,6 +59,15 @@ ADMIN_IDS = set(
     int(x.strip())
     for x in os.environ.get("TELEGRAM_ADMIN_IDS", "").split(",")
     if x.strip()
+)
+# Opening the bot to every chat is an explicit choice, never a default. Without
+# this flag an empty TELEGRAM_ADMIN_IDS denies every administrative command,
+# because the adapter fronts commands that produce payment intents and mutate
+# the ledger.
+ALLOW_ALL_CHATS = os.environ.get("TELEGRAM_ALLOW_ALL", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
 )
 ALERT_IDS = [
     int(x.strip())
@@ -287,6 +297,28 @@ def answer_callback(callback_id: str, text: str = ""):
 # ---------------------------------------------------------------------------
 
 
+def _redact(args: list[str]) -> str:
+    """Mask secrets before an argv is written to the log.
+
+    An RPC URL can carry a provider key in its query string
+    (`...helius-rpc.com/?api-key=...`), and a key that reaches a log is a key
+    that has leaked.
+    """
+    out: list[str] = []
+    mask_next = False
+    for a in args:
+        if mask_next:
+            out.append("***")
+            mask_next = False
+            continue
+        if a in ("--rpc", "--rpc-url", "--api-key"):
+            out.append(a)
+            mask_next = True
+            continue
+        out.append(re.sub(r"(api-key=)[^&]*", r"\1***", a))
+    return " ".join(out)
+
+
 def run_selo(args: list[str], timeout: int = 300) -> tuple[int, str]:
     """Execute selo-tool with streaming capture.
 
@@ -300,7 +332,7 @@ def run_selo(args: list[str], timeout: int = 300) -> tuple[int, str]:
             selo_path = selo_path + ".exe"
 
     cmd = [selo_path] + args
-    logging.info("run: %s (cwd=%s)", " ".join(cmd), DATA_DIR)
+    logging.info("run: %s (cwd=%s)", _redact(cmd), DATA_DIR)
     try:
         proc = subprocess.run(
             cmd,
@@ -353,7 +385,7 @@ def run_selo_streaming(args: list[str], chat_id: int, timeout: int = 600) -> str
             selo_path = selo_path + ".exe"
 
     cmd = [selo_path] + args
-    logging.info("streaming: %s", " ".join(cmd))
+    logging.info("streaming: %s", _redact(cmd))
     try:
         proc = subprocess.Popen(
             cmd,
@@ -401,15 +433,16 @@ def run_selo_streaming(args: list[str], chat_id: int, timeout: int = 600) -> str
 # Command routing
 # ---------------------------------------------------------------------------
 
-# Destructive/administrative commands gated to ADMIN_IDS.
+# Destructive/administrative commands gated to ADMIN_IDS. record-sample belongs
+# here because it writes an acquisition into the cost-basis book, which is a
+# ledger mutation even though its name reads like a read.
 ADMIN_COMMANDS = {
     "close", "issue", "refund", "expire", "ingest", "anchor",
-    "rules",
+    "rules", "record-sample",
 }
 READONLY_COMMANDS = {
     "balance", "check", "confirm", "review", "backfill", "ptax",
     "blockhash", "export-html", "verify", "tax-report", "status",
-    "record-sample",
 }
 
 HELP_TEXT = """*Selo Cryptographic Accounting Engine*
@@ -444,10 +477,14 @@ Type `/status` for store and watcher health."""
 
 
 def is_admin(chat_id: int) -> bool:
-    return not ADMIN_IDS or chat_id in ADMIN_IDS
+    # Fail closed. An empty allowlist denies, unless the operator opted in to an
+    # open bot with an explicit TELEGRAM_ALLOW_ALL flag.
+    if ALLOW_ALL_CHATS:
+        return True
+    return chat_id in ADMIN_IDS
 
 
-def dispatch(chat_id: int, text: str) -> Optional[str]:
+def dispatch(chat_id: int, text: str, user_id: Optional[int] = None) -> Optional[str]:
     """Route a Telegram message to a selo-tool command.
 
     Returns a reply string, or None when the message should be dropped.
@@ -489,7 +526,7 @@ def dispatch(chat_id: int, text: str) -> Optional[str]:
 
     # ---- Confirm token (gate destructive ops) ----
     if cmd == "yes":
-        return _handle_confirm(chat_id, args)
+        return _handle_confirm(chat_id, user_id, args)
 
     # ---- Standard command passthrough ----
     # Map chat-friendly command names to selo-tool subcommands.
@@ -521,11 +558,17 @@ def dispatch(chat_id: int, text: str) -> Optional[str]:
 
     # ---- export-html (gated, produces file) ----
     if cmd in ("export-html", "exporthtml"):
+        unsafe = _unsafe_output(args)
+        if unsafe:
+            return unsafe
         return run_selo_pretty(["export-html"] + args)
 
     # ---- Close (needs confirm gate) ----
     if cmd == "close":
-        token = _make_confirm_token(chat_id, ["close"] + args)
+        unsafe = _unsafe_output(args)
+        if unsafe:
+            return unsafe
+        token = _make_confirm_token(chat_id, user_id, ["close"] + args)
         return (
             f"*Daily Close — Confirm*\n\n"
             f"Running: `selo-tool close {' '.join(args)}`\n\n"
@@ -535,7 +578,7 @@ def dispatch(chat_id: int, text: str) -> Optional[str]:
 
     # ---- Issue (needs confirm gate) ----
     if cmd == "issue":
-        token = _make_confirm_token(chat_id, ["issue"] + args)
+        token = _make_confirm_token(chat_id, user_id, ["issue"] + args)
         return (
             f"*Issue Payment Quote — Confirm*\n\n"
             f"Running: `selo-tool issue {' '.join(args)}`\n\n"
@@ -571,32 +614,51 @@ def forward_to_llm(chat_id: int, text: str) -> str:
 
 # ---- Confirm-token machinery ----
 
-_pending_confirms: dict[str, tuple[int, list[str], float]] = {}
-"""token -> (chat_id, args, expires_at)"""
+_pending_confirms: dict[str, tuple[int, int, list[str], float]] = {}
+"""token -> (chat_id, user_id, args, expires_at)"""
 
 
-def _make_confirm_token(chat_id: int, args: list[str]) -> str:
-    import random
-
-    token = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=4))
-    _pending_confirms[token] = (chat_id, args, time.time() + 120)
+def _make_confirm_token(chat_id: int, user_id: Optional[int], args: list[str]) -> str:
+    # 8 characters from the CSPRNG: 36^8 is far past guessing, and secrets
+    # avoids the Mersenne Twister predictability random.choices carries.
+    token = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(8))
+    _pending_confirms[token] = (chat_id, user_id or 0, args, time.time() + 120)
     return token
 
 
-def _handle_confirm(chat_id: int, args: list[str]) -> Optional[str]:
+def _handle_confirm(chat_id: int, user_id: Optional[int], args: list[str]) -> Optional[str]:
     if not args:
         return "Usage: `/yes <token>`"
     token = args[0]
     entry = _pending_confirms.pop(token, None)
     if entry is None:
         return "Unknown or expired confirmation token. Issue the command again."
-    stored_chat, cmd_args, expires = entry
-    if stored_chat != chat_id:
-        return "This confirmation token belongs to a different chat."
+    stored_chat, stored_user, cmd_args, expires = entry
+    # Bind to the person, not just the room: in a group every member shares a
+    # chat_id, so a chat-only check would let one member approve another's
+    # staged refund.
+    if stored_chat != chat_id or stored_user != (user_id or 0):
+        return "This confirmation token belongs to a different user."
     if time.time() > expires:
         return "Confirmation token expired. Issue the command again."
     result = run_selo_pretty(cmd_args)
     return result
+
+
+def _unsafe_output(args: list[str]) -> Optional[str]:
+    """Reject an --output path that escapes the working directory.
+
+    The CLI accepts any path, which is right for an operator at a terminal. A
+    chat message is not that: it reaches this process from the network, so the
+    destination is pinned to the data directory.
+    """
+    for i, a in enumerate(args):
+        if a == "--output" and i + 1 < len(args):
+            p = args[i + 1]
+            if os.path.isabs(p) or ".." in Path(p).parts:
+                return "Output path must be relative and stay inside the working directory."
+    return None
+
 
 
 # ---- Argument parser that respects quoted strings ----
@@ -748,7 +810,7 @@ def _wizard_issue(chat_id: int, state: dict, text: str) -> str:
         ]
         if collected.get("label"):
             args += ["--label", collected["label"]]
-        token = _make_confirm_token(chat_id, args)
+        token = _make_confirm_token(chat_id, user_id, args)
         send_telegram(
             chat_id,
             f"*Confirm payment quote*\n\n"
@@ -802,7 +864,7 @@ def _wizard_close(chat_id: int, state: dict, text: str) -> str:
         day_start = now - (now % 86400)
         day_end = day_start + 86400
         args = ["close", "--start", str(day_start), "--end", str(day_end)]
-        token = _make_confirm_token(chat_id, args)
+        token = _make_confirm_token(chat_id, user_id, args)
         send_telegram(
             chat_id,
             f"*Confirm daily close*\n\n"
@@ -1028,7 +1090,9 @@ def _export_range_buttons(chat_id: int, pubkey: str) -> str:
     return ""
 
 
-def handle_callback(chat_id: int, callback_data: str, callback_id: str) -> Optional[str]:
+def handle_callback(
+    chat_id: int, callback_data: str, callback_id: str, user_id: Optional[int] = None
+) -> Optional[str]:
     """Route an inline-button tap to the matching action."""
     answer_callback(callback_id)
     if callback_data == "menu:help":
@@ -1274,7 +1338,7 @@ def _stream_ingest(chat_id: int, args: list[str]):
             selo_path = selo_path + ".exe"
 
     cmd = [selo_path, "ingest"] + args
-    logging.info("ingest worker: %s", " ".join(cmd))
+    logging.info("ingest worker: %s", _redact(cmd))
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1590,10 +1654,11 @@ def poll_telegram(stop_event: threading.Event):
                         cb_data = cb.get("data", "")
                         cb_id = cb.get("id", "")
                         cb_msg_id = cb.get("message", {}).get("message_id")
+                        cb_user_id = (cb.get("from") or {}).get("id")
                         if not chat_id or not cb_data:
                             continue
                         logging.info("[chat %s] callback: %s", chat_id, cb_data)
-                        reply = handle_callback(chat_id, cb_data, cb_id)
+                        reply = handle_callback(chat_id, cb_data, cb_id, cb_user_id)
                         # After a terminal choice, clear this menu's buttons so
                         # the tap target self-destructs instead of lingering.
                         if cb_msg_id and cb_data not in (
@@ -1644,7 +1709,7 @@ def poll_telegram(stop_event: threading.Event):
 
                     with _run_lock:
                         pass
-                    reply = dispatch(chat_id, text)
+                    reply = dispatch(chat_id, text, (msg.get("from") or {}).get("id"))
                     if reply:
                         send_telegram(chat_id, reply)
         except Exception as e:
@@ -1701,7 +1766,17 @@ def main():
     logging.info("=== Selo Telegram Operational Harness ===")
     logging.info("SELO_PATH: %s", SELO_PATH)
     logging.info("DATA_DIR: %s", DATA_DIR)
-    logging.info("ADMIN_IDS: %s", ADMIN_IDS or "(none — all open)")
+    if ALLOW_ALL_CHATS:
+        logging.warning(
+            "ADMIN_IDS: %s with TELEGRAM_ALLOW_ALL set - every chat is an "
+            "administrator. Do not use this on a public bot.",
+            ADMIN_IDS or "(empty)",
+        )
+    else:
+        logging.info(
+            "ADMIN_IDS: %s (admin commands are denied to every other chat)",
+            ADMIN_IDS or "(empty - all admin commands denied)",
+        )
     logging.info("ALERT_IDS: %s", ALERT_IDS or "(none)")
     logging.info("MERCHANT: %s", MERCHANT_PUBKEY or "(not set)")
     logging.info("APScheduler: %s", "available" if HAS_APSCHEDULER else "not installed — cron disabled")
