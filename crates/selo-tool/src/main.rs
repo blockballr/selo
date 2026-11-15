@@ -318,6 +318,30 @@ enum Commands {
 }
 
 #[allow(dead_code)]
+/// Write a state file that carries wallet addresses, amounts and counterparty
+/// names. On Unix the file is created 0600 so another local user on the same
+/// host cannot read the accounting record; elsewhere the platform default
+/// stands. Truncating an existing file keeps its original mode, so the mode is
+/// only set on creation, which is the case that matters for a fresh install.
+fn write_private(path: &str, data: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(data.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, data)
+    }
+}
+
 fn load_store() -> SeloStore {
     if Path::new(STORE_FILE).exists() {
         if let Ok(data) = fs::read_to_string(STORE_FILE) {
@@ -332,7 +356,7 @@ fn load_store() -> SeloStore {
 #[allow(dead_code)]
 fn save_store(store: &SeloStore) {
     if let Ok(data) = serde_json::to_string_pretty(store) {
-        let _ = fs::write(STORE_FILE, data);
+        let _ = write_private(STORE_FILE, &data);
     }
 }
 
@@ -349,7 +373,7 @@ fn load_rules() -> CounterpartyRegistry {
 
 fn save_rules(rules: &CounterpartyRegistry) {
     if let Ok(data) = serde_json::to_string_pretty(rules) {
-        let _ = fs::write(RULES_FILE, data);
+        let _ = write_private(RULES_FILE, &data);
     }
 }
 
@@ -366,7 +390,7 @@ fn load_multi_ledger(pubkey: &str) -> MultiWalletLedger {
 fn save_multi_ledger(pubkey: &str, ledger: &MultiWalletLedger) {
     let filename = format!("{}{}.json", LEDGER_FILE_PREFIX, pubkey);
     if let Ok(data) = serde_json::to_string_pretty(ledger) {
-        let _ = fs::write(filename, data);
+        let _ = write_private(&filename, &data);
     }
 }
 
@@ -383,7 +407,7 @@ fn load_merchant() -> MerchantConfig {
 
 fn save_merchant(cfg: &MerchantConfig) {
     if let Ok(data) = serde_json::to_string_pretty(cfg) {
-        let _ = fs::write(MERCHANT_FILE, data);
+        let _ = write_private(MERCHANT_FILE, &data);
     }
 }
 
