@@ -306,9 +306,11 @@ externally.
 period anchor and refunds render an unsigned transaction on a durable nonce and
 wait for a human to sign. No code path in this repository signs a transfer.
 
-**The Telegram adapter defaults to open.** `adapters/telegram/main.py` treats
-every chat as an administrator when `TELEGRAM_ADMIN_IDS` is unset. Set it. A
-short review of that adapter is in `docs/`.
+**The Telegram adapter fails closed.** `adapters/telegram/main.py` denies every
+administrative command when `TELEGRAM_ADMIN_IDS` is unset. Opening the bot to
+every chat requires an explicit `TELEGRAM_ALLOW_ALL` opt-in and logs a warning
+at startup. Set the allowlist. The review of that adapter, with its findings and
+remediations, is in `docs/security-review.md`.
 
 ### License
 
