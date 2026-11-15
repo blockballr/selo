@@ -275,6 +275,41 @@ are `ZEROCLAW_channels__telegram__primary__bot_token` and
 `ZEROCLAW_providers__models__opencode__go__api_key`. Never commit `.env`; it
 is already gitignored. Full setup instructions are in `adapters/README.md`.
 
+### Known Limitations
+
+**The ZK proof setup is a test setup.** `prove` builds, proves, and verifies a
+circuit showing that one close line is committed under the close's Poseidon
+root, but the proving key is generated in process from a fixed seed
+(`StdRng::seed_from_u64(0xC0FFEE)` in `crates/selo-core/src/prove.rs`). Anyone
+can regenerate that key, so a proof produced by this build carries no assurance
+to a third party. It demonstrates the circuit and the witness, nothing more. A
+real deployment needs a Groth16 ceremony or published parameters with the
+verifying key anchored. Until then, do not describe this as zero-knowledge
+verification, and do not rely on `prove` output as evidence in a dispute.
+
+**Integrity, as distinct from proof.** `verify --root` re-derives the Poseidon
+commitment from the local ledger and is not affected by the gap above. The
+anchored close is still tamper-evident against edits after the fact.
+
+**Valuation has a documented fallback.** `DEFAULT_HISTORICAL_PTAX` is `5.0500`
+and is used whenever the live Banco Central do Brasil rate cannot be resolved
+for a date (`crates/selo-core/src/ptax.rs`). It stops a failed fetch from
+poisoning the book with a zero, but a day valued at the constant is not valued
+at that day's real rate. Resolved rates are persisted, so a book is
+deterministic and offline after first ingest.
+
+**Not audited.** There is no third-party security audit. The accounting
+arithmetic and the Groth16 circuit constraints have not been reviewed
+externally.
+
+**No signing key is held.** Selo reads and computes at custody tier T0. The
+period anchor and refunds render an unsigned transaction on a durable nonce and
+wait for a human to sign. No code path in this repository signs a transfer.
+
+**The Telegram adapter defaults to open.** `adapters/telegram/main.py` treats
+every chat as an administrator when `TELEGRAM_ADMIN_IDS` is unset. Set it. A
+short review of that adapter is in `docs/`.
+
 ### License
 
 Licensed under Apache-2.0
